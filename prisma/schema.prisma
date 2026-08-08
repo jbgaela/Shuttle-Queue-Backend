@@ -1,0 +1,468 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+enum QueueMasterStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum SkillLevel {
+  NEWBIE
+  BEGINNER
+  INTERMEDIATE
+  UPPER_INTERMEDIATE
+  ADVANCED
+}
+
+enum PlayerStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum SessionStatus {
+  DRAFT
+  ACTIVE
+  ENDED
+  CANCELLED
+}
+
+enum SessionPlayerStatus {
+  INACTIVE
+  WAITING
+  QUEUED
+  PLAYING
+  RESTING
+  CHECKED_OUT
+}
+
+enum CourtStatus {
+  AVAILABLE
+  OCCUPIED
+  PAUSED
+  CLOSED
+}
+
+enum MatchStatus {
+  QUEUED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum MatchSource {
+  MANUAL
+  AUTOMATIC
+  MANUAL_ADJUSTED
+}
+
+enum MatchmakingMode {
+  OPEN
+  SAME_SKILL
+  BALANCED
+  SAME_GENDER
+  MIXED_DOUBLES
+}
+
+enum TeamSide {
+  A
+  B
+}
+
+enum FeeMode {
+  FIXED_PER_PLAYER
+  EQUAL_SPLIT
+}
+
+enum PaymentKind {
+  COLLECTION
+  REFUND
+  WAIVER
+  WAIVER_REVERSAL
+}
+
+enum PaymentMethod {
+  CASH
+  EWALLET
+  OTHER
+}
+
+model QueueMaster {
+  id                    String             @id @default(uuid()) @map("_id")
+  username              String
+  normalizedUsername    String             @unique
+  passwordHash          String
+  status                QueueMasterStatus  @default(ACTIVE)
+  passwordChangedAt     DateTime           @default(now())
+  lastLoginAt           DateTime?
+  failedLoginCount      Int                @default(0)
+  lockedUntil           DateTime?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  version               Int                @default(1)
+  settings              QueueMasterSettings?
+  players               Player[]
+  sessions              QueueSession[]
+  authSessions          AuthSession[]
+  careerStats           PlayerCareerStat[]
+  auditLogs             AuditLog[]
+  idempotencyRecords    IdempotencyRecord[]
+  syncState             AccountSyncState?
+}
+
+model QueueMasterSettings {
+  id                    String             @id @default(uuid()) @map("_id")
+  queueMasterId         String             @unique
+  queueMaster           QueueMaster        @relation(fields: [queueMasterId], references: [id])
+  pointsToWin           Int                @default(31)
+  winBy                 Int                @default(1)
+  scoreCap             Int?
+  bestOf               Int                @default(1)
+  minimumRestMinutes   Int                @default(0)
+  defaultFeeMode       FeeMode            @default(FIXED_PER_PLAYER)
+  defaultFixedFeeMinor Int?
+  currencyCode         String             @default("PHP")
+  timeZone             String             @default("Asia/Manila")
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  version               Int                @default(1)
+}
+
+model AccountSyncState {
+  id                String      @id @default(uuid()) @map("_id")
+  queueMasterId     String      @unique
+  queueMaster       QueueMaster @relation(fields: [queueMasterId], references: [id])
+  cloudRevision     Int         @default(1)
+  lastDeviceId      String?
+  lastOperationId   String?
+  lastSyncedAt      DateTime?
+  schemaVersion     Int         @default(1)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+  version           Int         @default(1)
+}
+
+model AuthSession {
+  id                String       @id @default(uuid()) @map("_id")
+  queueMasterId     String
+  queueMaster       QueueMaster  @relation(fields: [queueMasterId], references: [id])
+  secretHash        String       @unique
+  previousHash      String?
+  csrfTokenHash     String
+  createdAt         DateTime     @default(now())
+  lastSeenAt        DateTime     @default(now())
+  idleExpiresAt     DateTime
+  absoluteExpiresAt DateTime
+  rotatedAt         DateTime?
+  revokedAt         DateTime?
+  revokeReason      String?
+  userAgentHash     String?
+  ipPrefixHash      String?
+  version           Int          @default(1)
+
+  @@index([queueMasterId, revokedAt])
+  @@index([idleExpiresAt])
+  @@index([absoluteExpiresAt])
+}
+
+model LoginThrottle {
+  id            String   @id @default(uuid()) @map("_id")
+  keyHash       String   @unique
+  failureCount  Int      @default(0)
+  windowStarted DateTime @default(now())
+  blockedUntil  DateTime?
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+model Player {
+  id                 String        @id @default(uuid()) @map("_id")
+  queueMasterId      String
+  queueMaster        QueueMaster   @relation(fields: [queueMasterId], references: [id])
+  displayName        String
+  normalizedName     String
+  gender             Gender
+  skillLevel         SkillLevel
+  skillWeight        Int
+  status             PlayerStatus   @default(ACTIVE)
+  archivedAt         DateTime?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  version            Int            @default(1)
+  sessionPlayers     SessionPlayer[]
+  careerStats        PlayerCareerStat[]
+
+  @@unique([queueMasterId, normalizedName])
+  @@index([queueMasterId, status, normalizedName])
+  @@index([queueMasterId, status, gender, skillLevel])
+}
+
+model QueueSession {
+  id                    String              @id @default(uuid()) @map("_id")
+  queueMasterId         String
+  queueMaster           QueueMaster         @relation(fields: [queueMasterId], references: [id])
+  name                  String
+  normalizedName        String
+  sessionDate           DateTime
+  status                SessionStatus       @default(DRAFT)
+  startedAt             DateTime?
+  endedAt               DateTime?
+  cancelledAt           DateTime?
+  pointsToWin           Int                 @default(31)
+  winBy                 Int                 @default(1)
+  scoreCap             Int?
+  bestOf               Int                 @default(1)
+  minimumRestMinutes   Int                 @default(0)
+  matchmakingAlgorithm  String              @default("v1")
+  matchmakingRevision   Int                 @default(1)
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  version               Int                 @default(1)
+  players               SessionPlayer[]
+  courts                SessionCourt[]
+  matches               Match[]
+  feeConfig             SessionFeeConfig?
+  payments              Payment[]
+
+  @@index([queueMasterId, status, sessionDate])
+  @@index([queueMasterId, startedAt])
+}
+
+model SessionPlayer {
+  id                    String              @id @default(uuid()) @map("_id")
+  sessionId             String
+  session               QueueSession        @relation(fields: [sessionId], references: [id])
+  playerId              String
+  player                Player              @relation(fields: [playerId], references: [id])
+  displayNameSnapshot   String
+  normalizedNameSnapshot String
+  genderSnapshot        Gender
+  skillLevelSnapshot    SkillLevel
+  skillWeightSnapshot   Int
+  status                SessionPlayerStatus @default(INACTIVE)
+  checkedInAt           DateTime?
+  checkedOutAt          DateTime?
+  restStartedAt         DateTime?
+  queueEnteredAt        DateTime?
+  lastMatchEndedAt      DateTime?
+  manualPriority        Int                 @default(0)
+  priorityReason        String?
+  currentMatchId        String?
+  matchesPlayed         Int                 @default(0)
+  wins                  Int                 @default(0)
+  losses                Int                 @default(0)
+  pointsFor             Int                 @default(0)
+  pointsAgainst         Int                 @default(0)
+  amountDueMinor        Int                 @default(0)
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  version               Int                 @default(1)
+  participants          MatchParticipant[]
+  payments              Payment[]
+
+  @@unique([sessionId, playerId])
+  @@index([sessionId, status, queueEnteredAt])
+  @@index([sessionId, matchesPlayed, queueEnteredAt])
+  @@index([currentMatchId])
+}
+
+model SessionCourt {
+  id             String       @id @default(uuid()) @map("_id")
+  sessionId      String
+  session        QueueSession @relation(fields: [sessionId], references: [id])
+  name           String
+  normalizedName String
+  displayOrder   Int          @default(0)
+  status         CourtStatus  @default(AVAILABLE)
+  currentMatchId String?
+  closedAt       DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  version        Int          @default(1)
+  matches        Match[]      @relation("MatchCourt")
+
+  @@unique([sessionId, normalizedName])
+  @@index([sessionId, status, displayOrder])
+  @@index([currentMatchId])
+}
+
+model Match {
+  id                    String              @id @default(uuid()) @map("_id")
+  sessionId             String
+  session               QueueSession        @relation(fields: [sessionId], references: [id])
+  courtId               String?
+  court                 SessionCourt?       @relation("MatchCourt", fields: [courtId], references: [id])
+  status                MatchStatus         @default(QUEUED)
+  source                MatchSource
+  matchmakingMode       MatchmakingMode?
+  algorithmVersion      String?
+  suggestionKey         String?
+  suggestionExplanation Json?
+  queuedAt              DateTime            @default(now())
+  startedAt             DateTime?
+  completedAt           DateTime?
+  cancelledAt           DateTime?
+  cancellationReason    String?
+  winnerTeam            TeamSide?
+  currentRevisionId     String?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  version               Int                 @default(1)
+  participants          MatchParticipant[]
+  scoreRevisions        MatchScoreRevision[] @relation("MatchRevisions")
+}
+
+model MatchParticipant {
+  id                  String        @id @default(uuid()) @map("_id")
+  matchId             String
+  match               Match         @relation(fields: [matchId], references: [id])
+  sessionPlayerId     String
+  sessionPlayer       SessionPlayer @relation(fields: [sessionPlayerId], references: [id])
+  team                TeamSide
+  teamSlot            Int
+  priorQueueEnteredAt DateTime?
+  createdAt           DateTime      @default(now())
+
+  @@unique([matchId, sessionPlayerId])
+  @@unique([matchId, team, teamSlot])
+  @@index([sessionPlayerId, matchId])
+}
+
+model MatchScoreRevision {
+  id                    String              @id @default(uuid()) @map("_id")
+  matchId               String
+  match                 Match               @relation("MatchRevisions", fields: [matchId], references: [id])
+  revisionNumber        Int
+  winnerTeam            TeamSide
+  reason                String?
+  createdByQueueMasterId String
+  supersedesRevisionId  String?
+  createdAt             DateTime            @default(now())
+  games                 MatchGame[]
+
+  @@unique([matchId, revisionNumber])
+  @@index([matchId, createdAt])
+}
+
+model MatchGame {
+  id             String             @id @default(uuid()) @map("_id")
+  scoreRevisionId String
+  scoreRevision  MatchScoreRevision @relation(fields: [scoreRevisionId], references: [id])
+  gameNumber     Int
+  teamAScore     Int
+  teamBScore     Int
+  winnerTeam     TeamSide
+  createdAt      DateTime           @default(now())
+
+  @@unique([scoreRevisionId, gameNumber])
+}
+
+model PlayerCareerStat {
+  id                  String      @id @default(uuid()) @map("_id")
+  queueMasterId       String
+  queueMaster         QueueMaster @relation(fields: [queueMasterId], references: [id])
+  playerId            String
+  player              Player      @relation(fields: [playerId], references: [id])
+  matchesPlayed       Int         @default(0)
+  wins                Int         @default(0)
+  losses              Int         @default(0)
+  pointsFor           Int         @default(0)
+  pointsAgainst       Int         @default(0)
+  pointDifferential   Int         @default(0)
+  winRateBasisPoints  Int         @default(0)
+  currentStreak       Int         @default(0)
+  lastPlayedAt        DateTime?
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+  version             Int         @default(1)
+
+  @@unique([queueMasterId, playerId])
+  @@index([queueMasterId, wins, winRateBasisPoints, pointDifferential])
+}
+
+model SessionFeeConfig {
+  id                    String       @id @default(uuid()) @map("_id")
+  sessionId             String       @unique
+  session               QueueSession @relation(fields: [sessionId], references: [id])
+  mode                  FeeMode
+  currencyCode          String       @default("PHP")
+  fixedAmountPerPlayerMinor Int?
+  expectedSessionCostMinor  Int?
+  participationRule     String       @default("EVER_CHECKED_IN")
+  frozenAt              DateTime?
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+  version               Int          @default(1)
+}
+
+model Payment {
+  id                  String        @id @default(uuid()) @map("_id")
+  sessionId           String
+  session             QueueSession  @relation(fields: [sessionId], references: [id])
+  sessionPlayerId     String
+  sessionPlayer       SessionPlayer @relation(fields: [sessionPlayerId], references: [id])
+  kind                PaymentKind
+  method              PaymentMethod?
+  amountMinor         Int
+  reference           String?
+  note                String?
+  reversalOfPaymentId String?
+  reversalOf          Payment?      @relation("PaymentReversal", fields: [reversalOfPaymentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reversals           Payment[]     @relation("PaymentReversal")
+  recordedById        String
+  occurredAt          DateTime      @default(now())
+  createdAt            DateTime      @default(now())
+
+  @@index([sessionId, sessionPlayerId, occurredAt])
+  @@index([sessionId, kind, method])
+}
+
+model AuditLog {
+  id             String       @id @default(uuid()) @map("_id")
+  queueMasterId  String
+  queueMaster    QueueMaster  @relation(fields: [queueMasterId], references: [id])
+  sessionId      String?
+  action         String
+  entityType     String
+  entityId       String
+  reason         String?
+  beforeJson     Json?
+  afterJson      Json?
+  requestId      String
+  createdAt      DateTime     @default(now())
+
+  @@index([sessionId, createdAt])
+  @@index([entityType, entityId, createdAt])
+  @@index([queueMasterId, action, createdAt])
+}
+
+model IdempotencyRecord {
+  id              String       @id @default(uuid()) @map("_id")
+  queueMasterId   String
+  queueMaster     QueueMaster  @relation(fields: [queueMasterId], references: [id])
+  operation       String
+  key             String
+  requestHash     String
+  resultType      String
+  resultId        String
+  responseStatus  Int
+  createdAt       DateTime     @default(now())
+  expiresAt       DateTime
+
+  @@unique([queueMasterId, operation, key])
+  @@index([expiresAt])
+}

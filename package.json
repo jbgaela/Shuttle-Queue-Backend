@@ -1,0 +1,46 @@
+{
+  "name": "badminton-queue-backend",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
+  "scripts": {
+    "dev": "node --env-file=.env --import tsx --watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src prisma --ext .ts",
+    "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
+    "prisma:push": "prisma db push",
+    "seed": "node --env-file=.env --import tsx prisma/seed.ts",
+    "test": "tsx --test tests/unit/*.test.ts",
+    "test:unit": "node --test tests/unit/**/*.test.js"
+  },
+  "dependencies": {
+    "@shuttle-queue/domain": "1.0.0",
+    "@asteasolutions/zod-to-openapi": "9.1.0",
+    "@prisma/client": "6.19.3",
+    "argon2": "0.45.1",
+    "cookie-parser": "1.4.7",
+    "cors": "2.8.6",
+    "express": "5.2.1",
+    "express-rate-limit": "8.6.2",
+    "helmet": "8.3.0",
+    "pino": "10.3.1",
+    "pino-http": "11.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "1.4.10",
+    "@types/cors": "2.8.19",
+    "@types/express": "5.0.6",
+    "@types/node": "24.13.3",
+    "eslint": "10.8.0",
+    "prisma": "6.19.3",
+    "tsx": "4.23.11",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.66.0"
+  }
+}
