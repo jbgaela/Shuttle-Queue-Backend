@@ -8,7 +8,7 @@ import pino from "pino";
 import pinoHttpModule from "pino-http";
 import { Prisma, Gender, MatchStatus, MatchSource, MatchmakingMode, PaymentKind, PaymentMethod, PlayerStatus, QueueMasterStatus, SessionPlayerStatus, SessionStatus, TeamSide, CourtStatus, FeeMode, SkillLevel } from "@prisma/client";
 import { z } from "zod";
-import { prisma } from "./lib/db.js";
+import { prisma, withTransactionRetry } from "./lib/db.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "./lib/history.js";
 import { config } from "./lib/config.js";
 import { AppError, badRequest, conflict, notFound, unauthorized } from "./lib/errors.js";
@@ -17,7 +17,7 @@ import { skillWeight } from "./lib/skills.js";
 import { allocateEqualSplit } from "./lib/fees.js";
 import { suggestMatch, type MatchHistory, type MatchPlayer } from "./lib/matchmaking.js";
 import { validateScores, type ScoreInput } from "./lib/score.js";
-import { clearLoginFailures, clearSessionCookie, issueSession, recordLoginFailure, requireAuth, requireMutationOrigin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
+import { clearLoginFailures, clearSessionCookie, currentCsrfToken, issueSession, recordLoginFailure, requireAuth, requireMutationOrigin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
 import type { CloudSnapshotV1 } from "@shuttle-queue/domain";
 
 const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "password", "passwordHash"] });
@@ -34,6 +34,8 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
       ? new AppError(422, "VALIDATION_ERROR", "The request is invalid.", error.flatten())
       : error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002"
         ? new AppError(409, "CONFLICT", "The requested value is already in use.")
+        : error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034"
+          ? new AppError(409, "CONCURRENCY_CONFLICT", "The data changed concurrently. Retry the request.")
         : error;
   const status = err instanceof AppError ? err.status : 500;
   if (status >= 500) logger.error({ err: error, requestId: response.locals.requestId }, "request failed");
@@ -76,7 +78,7 @@ api.put("/sync/snapshot", requireAuth, requireMutationOrigin, route(async (reque
   const queueMasterId = authUser(request).id;
   const body = parse(z.object({ schemaVersion: z.literal(1), deviceId: z.string().min(1).max(200), operationId: z.string().min(1).max(200), baseCloudRevision: z.number().int().min(0), force: z.boolean().default(false), snapshot: z.record(z.string(), z.unknown()), auditEvents: z.array(z.record(z.string(), z.unknown())).max(2000).default([]) }), request.body);
   const snapshot = validateCloudSnapshot(body.snapshot, queueMasterId);
-  const result = await prisma.$transaction(async (tx) => {
+  const result = await withTransactionRetry(async (tx) => {
     const existingOperation = await tx.idempotencyRecord.findFirst({ where: { queueMasterId, operation: "SYNC_SNAPSHOT", key: body.operationId } });
     if (existingOperation) {
       const current = await tx.accountSyncState.findUnique({ where: { queueMasterId } });
@@ -92,7 +94,7 @@ api.put("/sync/snapshot", requireAuth, requireMutationOrigin, route(async (reque
     const state = await tx.accountSyncState.update({ where: { queueMasterId }, data: { cloudRevision: { increment: 1 }, lastDeviceId: body.deviceId, lastOperationId: body.operationId, lastSyncedAt: new Date(), schemaVersion: 1, version: { increment: 1 } } });
     await tx.idempotencyRecord.create({ data: { queueMasterId, operation: "SYNC_SNAPSHOT", key: body.operationId, requestHash: snapshotChecksum(snapshot), resultType: "SYNC", resultId: String(state.cloudRevision), responseStatus: 200, expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 30) } });
     return { state, alreadyApplied: false };
-  });
+  }, { maxWait: 10_000, timeout: 30_000 });
   responseData(response, { cloudRevision: result.state.cloudRevision, lastSyncedAt: result.state.lastSyncedAt, lastDeviceId: result.state.lastDeviceId, schemaVersion: result.state.schemaVersion, alreadyApplied: result.alreadyApplied });
 }));
 
@@ -709,7 +711,7 @@ export function createApp() {
   }));
   api.post("/auth/renew", requireAuth, requireMutationOrigin, route(async (request, response) => { const issued = await rotateSession(request as AuthenticatedRequest, response); responseData(response, issued); }));
   api.post("/auth/logout", requireAuth, requireMutationOrigin, route(async (request, response) => { const auth = getAuth(request); await prisma.authSession.update({ where: { id: auth.sessionId }, data: { revokedAt: new Date(), revokeReason: "logout" } }); clearSessionCookie(response); noContent(response); }));
-  api.get("/auth/me", requireAuth, route(async (request, response) => { const auth = getAuth(request); responseData(response, { user: { id: auth.queueMaster.id, username: auth.queueMaster.username, role: "QUEUE_MASTER" }, csrfToken: auth.csrfToken }); }));
+  api.get("/auth/me", requireAuth, route(async (request, response) => { const auth = getAuth(request); const csrfToken = await currentCsrfToken(request as AuthenticatedRequest, response); responseData(response, { user: { id: auth.queueMaster.id, username: auth.queueMaster.username, role: "QUEUE_MASTER" }, csrfToken }); }));
 
   api.get("/settings", requireAuth, route(async (request, response) => { const settings = await prisma.queueMasterSettings.findUnique({ where: { queueMasterId: authUser(request).id } }); responseData(response, settings); }));
   api.patch("/settings", requireAuth, requireMutationOrigin, route(async (request, response) => {

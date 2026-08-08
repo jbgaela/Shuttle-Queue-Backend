@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: badminton-queue-api
+    runtime: node
+    rootDir: .
+    plan: starter
+    buildCommand: npm ci && npm run build:domain && npm run prisma:generate --workspace badminton-queue-backend && npm run build:backend
+    startCommand: npm run start --workspace badminton-queue-backend
+    healthCheckPath: /health/ready
+    buildFilter:
+      paths:
+        - backend/**
+        - packages/domain/**
+        - package.json
+        - package-lock.json
+        - render.yaml

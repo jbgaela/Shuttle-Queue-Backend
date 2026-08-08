@@ -7,10 +7,11 @@ import { config } from "./config.js";
 import { AppError, forbidden, unauthorized } from "./errors.js";
 
 export type AuthenticatedRequest = Request & {
-  auth?: { queueMaster: QueueMaster; sessionId: string; csrfToken: string; absoluteExpiresAt: Date; sessionVersion: number };
+  auth?: { queueMaster: QueueMaster; sessionId: string; csrfToken: string; csrfTokenHash: string; absoluteExpiresAt: Date; sessionVersion: number };
 };
 
 const cookieName = config.cookieSecure ? "__Host-bq-session" : "bq-session";
+const csrfCookieName = config.cookieSecure ? "__Host-bq-csrf" : "bq-csrf";
 const THROTTLE_ENTRY_TTL_MS = 30 * 60_000;
 const THROTTLE_CLEANUP_INTERVAL_MS = 60_000;
 let lastThrottleCleanupAt = 0;
@@ -30,7 +31,7 @@ const parseSessionCookie = (value: string | undefined) => {
   return { id: value.slice(0, separator), secret: value.slice(separator + 1) };
 };
 
-const setSessionCookie = (response: Response, value: string, expires: Date) => {
+const setSessionCookie = (response: Response, value: string, expires: Date, csrfToken: string) => {
   response.cookie(cookieName, value, {
     httpOnly: true,
     secure: config.cookieSecure,
@@ -38,10 +39,20 @@ const setSessionCookie = (response: Response, value: string, expires: Date) => {
     path: "/",
     expires,
   });
+  response.cookie(csrfCookieName, csrfToken, {
+    httpOnly: false,
+    secure: config.cookieSecure,
+    sameSite: "strict",
+    path: "/",
+    expires,
+  });
 };
+
+const setCsrfCookie = (response: Response, value: string, expires: Date) => response.cookie(csrfCookieName, value, { httpOnly: false, secure: config.cookieSecure, sameSite: "strict", path: "/", expires });
 
 export const clearSessionCookie = (response: Response) => {
   response.clearCookie(cookieName, { httpOnly: true, secure: config.cookieSecure, sameSite: "strict", path: "/" });
+  response.clearCookie(csrfCookieName, { httpOnly: false, secure: config.cookieSecure, sameSite: "strict", path: "/" });
 };
 
 export async function issueSession(queueMasterId: string, request: Request, response: Response) {
@@ -61,7 +72,7 @@ export async function issueSession(queueMasterId: string, request: Request, resp
       ipPrefixHash: request.ip ? createHash("sha256").update(request.ip.split(".").slice(0, 3).join(".")).digest("hex") : undefined,
     },
   });
-  setSessionCookie(response, `${session.id}.${secret}`, absoluteExpiresAt);
+  setSessionCookie(response, `${session.id}.${secret}`, absoluteExpiresAt, csrfToken);
   return { session, csrfToken, expiresAt: idleExpiresAt };
 }
 
@@ -82,7 +93,7 @@ export async function rotateSession(request: AuthenticatedRequest, response: Res
   if (claimed.count !== 1) throw unauthorized("Your session has expired.");
   const updated = await prisma.authSession.findUnique({ where: { id: current.sessionId } });
   if (!updated) throw unauthorized("Your session has expired.");
-  setSessionCookie(response, `${updated.id}.${nextSecret}`, updated.absoluteExpiresAt);
+  setSessionCookie(response, `${updated.id}.${nextSecret}`, updated.absoluteExpiresAt, nextCsrf);
   return { csrfToken: nextCsrf, expiresAt: updated.idleExpiresAt };
 }
 
@@ -103,8 +114,36 @@ async function resolveAuth(request: AuthenticatedRequest) {
   if (session.lastSeenAt.getTime() < Date.now() - 5 * 60_000) {
     await prisma.authSession.update({ where: { id: session.id }, data: { lastSeenAt: new Date() } });
   }
-  request.auth = { queueMaster: session.queueMaster, sessionId: session.id, csrfToken, absoluteExpiresAt: session.absoluteExpiresAt, sessionVersion: session.version };
+  request.auth = { queueMaster: session.queueMaster, sessionId: session.id, csrfToken, csrfTokenHash: session.csrfTokenHash, absoluteExpiresAt: session.absoluteExpiresAt, sessionVersion: session.version };
   return request.auth;
+}
+
+export async function currentCsrfToken(request: AuthenticatedRequest, response: Response) {
+  const auth = request.auth;
+  if (!auth) throw unauthorized();
+  const headerToken = request.get("x-csrf-token") ?? "";
+  const cookieToken = request.cookies?.[csrfCookieName] ?? "";
+  if (headerToken && safeEqual(digest(headerToken), auth.csrfTokenHash)) {
+    auth.csrfToken = headerToken;
+    setCsrfCookie(response, headerToken, auth.absoluteExpiresAt);
+    return headerToken;
+  }
+  if (cookieToken && safeEqual(digest(cookieToken), auth.csrfTokenHash)) {
+    auth.csrfToken = cookieToken;
+    setCsrfCookie(response, cookieToken, auth.absoluteExpiresAt);
+    return cookieToken;
+  }
+
+  const nextCsrf = token();
+  const claimed = await prisma.authSession.updateMany({
+    where: { id: auth.sessionId, version: auth.sessionVersion, csrfTokenHash: auth.csrfTokenHash, revokedAt: null },
+    data: { csrfTokenHash: digest(nextCsrf) },
+  });
+  if (claimed.count !== 1) throw unauthorized("Your session has expired.");
+  auth.csrfToken = nextCsrf;
+  auth.csrfTokenHash = digest(nextCsrf);
+  setCsrfCookie(response, nextCsrf, auth.absoluteExpiresAt);
+  return nextCsrf;
 }
 
 export const requireAuth: RequestHandler = async (request, _response, next: NextFunction) => {
