@@ -1,25 +1,30 @@
 {
   "name": "badminton-queue-backend",
   "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "type": "module",
   "engines": {
     "node": ">=24.19.0 <25"
   },
   "scripts": {
-    "dev": "node --env-file=.env --import tsx --watch src/server.ts",
-    "build": "tsc -p tsconfig.json",
+    "dev": "npm run build:domain && npm run prisma:generate && node --env-file=.env --import tsx --watch src/server.ts",
+    "build:domain": "npm run build --workspace @shuttle-queue/domain",
+    "build": "npm run build:domain && npm run prisma:generate && tsc -p tsconfig.json",
     "start": "node dist/src/server.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "npm run build:domain && npm run prisma:generate && tsc -p tsconfig.json --noEmit",
     "lint": "eslint src prisma --ext .ts",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "prisma:push": "prisma db push",
     "seed": "node --env-file=.env --import tsx prisma/seed.ts",
-    "test": "tsx --test tests/unit/*.test.ts",
-    "test:unit": "node --test tests/unit/**/*.test.js"
+    "test": "npm run prisma:generate && tsx --test tests/unit/*.test.ts",
+    "test:unit": "node --test tests/unit/**/*.test.js",
+    "test:domain": "npm run build:domain && npm run test --workspace @shuttle-queue/domain"
   },
   "dependencies": {
-    "@shuttle-queue/domain": "1.0.0",
+    "@shuttle-queue/domain": "*",
     "@asteasolutions/zod-to-openapi": "9.1.0",
     "@prisma/client": "6.19.3",
     "argon2": "0.45.1",

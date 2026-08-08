@@ -4,12 +4,13 @@ services:
     runtime: node
     rootDir: .
     plan: starter
-    buildCommand: npm ci && npm run build:domain && npm run prisma:generate --workspace badminton-queue-backend && npm run build:backend
-    startCommand: npm run start --workspace badminton-queue-backend
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
     healthCheckPath: /health/ready
     buildFilter:
       paths:
-        - backend/**
+        - src/**
+        - prisma/**
         - packages/domain/**
         - package.json
         - package-lock.json
