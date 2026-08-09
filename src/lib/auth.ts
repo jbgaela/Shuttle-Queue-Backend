@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import type { NextFunction, Request, RequestHandler, Response } from "express";
+import type { CookieOptions, NextFunction, Request, RequestHandler, Response } from "express";
 import argon2 from "argon2";
 import type { QueueMaster } from "@prisma/client";
 import { prisma } from "./db.js";
@@ -12,6 +12,13 @@ export type AuthenticatedRequest = Request & {
 
 const cookieName = config.cookieSecure ? "__Host-bq-session" : "bq-session";
 const csrfCookieName = config.cookieSecure ? "__Host-bq-csrf" : "bq-csrf";
+// Production UI and API hosts are cross-site, so secure cookies must remain usable without shared third-party storage.
+const sharedCookieOptions: Pick<CookieOptions, "partitioned" | "path" | "sameSite" | "secure"> = {
+  partitioned: config.cookieSecure,
+  path: "/",
+  sameSite: config.cookieSecure ? "none" : "strict",
+  secure: config.cookieSecure,
+};
 const THROTTLE_ENTRY_TTL_MS = 30 * 60_000;
 const THROTTLE_CLEANUP_INTERVAL_MS = 60_000;
 let lastThrottleCleanupAt = 0;
@@ -33,26 +40,22 @@ const parseSessionCookie = (value: string | undefined) => {
 
 const setSessionCookie = (response: Response, value: string, expires: Date, csrfToken: string) => {
   response.cookie(cookieName, value, {
+    ...sharedCookieOptions,
     httpOnly: true,
-    secure: config.cookieSecure,
-    sameSite: "strict",
-    path: "/",
     expires,
   });
   response.cookie(csrfCookieName, csrfToken, {
+    ...sharedCookieOptions,
     httpOnly: false,
-    secure: config.cookieSecure,
-    sameSite: "strict",
-    path: "/",
     expires,
   });
 };
 
-const setCsrfCookie = (response: Response, value: string, expires: Date) => response.cookie(csrfCookieName, value, { httpOnly: false, secure: config.cookieSecure, sameSite: "strict", path: "/", expires });
+const setCsrfCookie = (response: Response, value: string, expires: Date) => response.cookie(csrfCookieName, value, { ...sharedCookieOptions, httpOnly: false, expires });
 
 export const clearSessionCookie = (response: Response) => {
-  response.clearCookie(cookieName, { httpOnly: true, secure: config.cookieSecure, sameSite: "strict", path: "/" });
-  response.clearCookie(csrfCookieName, { httpOnly: false, secure: config.cookieSecure, sameSite: "strict", path: "/" });
+  response.clearCookie(cookieName, { ...sharedCookieOptions, httpOnly: true });
+  response.clearCookie(csrfCookieName, { ...sharedCookieOptions, httpOnly: false });
 };
 
 export async function issueSession(queueMasterId: string, request: Request, response: Response) {
