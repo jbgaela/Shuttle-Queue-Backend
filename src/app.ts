@@ -14,7 +14,7 @@ import { config } from "./lib/config.js";
 import { AppError, badRequest, conflict, notFound, unauthorized } from "./lib/errors.js";
 import { normalizeName, normalizeText, normalizeUsername } from "./lib/normalize.js";
 import { skillWeight } from "./lib/skills.js";
-import { allocateEqualSplit } from "./lib/fees.js";
+import { allocateEqualSplit, collectionTotalsByPlayer } from "./lib/fees.js";
 import { suggestMatch, type MatchHistory, type MatchPlayer } from "./lib/matchmaking.js";
 import { validateScores, type ScoreInput } from "./lib/score.js";
 import { clearLoginFailures, clearSessionCookie, currentCsrfToken, issueSession, recordLoginFailure, requireAuth, requireMutationOrigin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
@@ -660,6 +660,7 @@ async function feeSummary(sessionId: string) {
     prisma.sessionPlayer.findMany({ where: { sessionId }, orderBy: { displayNameSnapshot: "asc" } }),
     prisma.payment.findMany({ where: { sessionId }, orderBy: { occurredAt: "asc" } }),
   ]);
+  const collectionMethodTotals = collectionTotalsByPlayer(payments);
   const byPlayer = new Map<string, { collected: number; refunded: number; waived: number }>();
   for (const payment of payments) {
     const balance = byPlayer.get(payment.sessionPlayerId) ?? { collected: 0, refunded: 0, waived: 0 };
@@ -674,7 +675,7 @@ async function feeSummary(sessionId: string) {
     const netCollected = balance.collected - balance.refunded;
     const outstanding = Math.max(0, player.amountDueMinor - netCollected - balance.waived);
     const status = balance.waived >= player.amountDueMinor && player.amountDueMinor > 0 ? "WAIVED" : outstanding === 0 && player.amountDueMinor > 0 ? "PAID" : netCollected > 0 ? "PARTIAL" : "UNPAID";
-    return { sessionPlayerId: player.id, displayName: player.displayNameSnapshot, dueMinor: player.amountDueMinor, collectedMinor: netCollected, waivedMinor: balance.waived, outstandingMinor: outstanding, status };
+    return { sessionPlayerId: player.id, displayName: player.displayNameSnapshot, dueMinor: player.amountDueMinor, collectedMinor: netCollected, waivedMinor: balance.waived, outstandingMinor: outstanding, status, collectionByMethodMinor: collectionMethodTotals.get(player.id) ?? { CASH: 0, EWALLET: 0, OTHER: 0 } };
   });
   return { config: configRecord, expectedMinor: configRecord?.mode === FeeMode.EQUAL_SPLIT ? configRecord.expectedSessionCostMinor ?? 0 : rows.reduce((sum, row) => sum + row.dueMinor, 0), collectedMinor: rows.reduce((sum, row) => sum + row.collectedMinor, 0), outstandingMinor: rows.reduce((sum, row) => sum + row.outstandingMinor, 0), paymentCount: payments.length, players: rows };
 }

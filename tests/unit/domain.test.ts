@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Gender, MatchmakingMode, SessionPlayerStatus, TeamSide } from "@prisma/client";
-import { allocateEqualSplit } from "../../src/lib/fees.js";
+import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
 import { suggestMatch, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
@@ -31,6 +31,19 @@ test("score validation rejects ties and caps, and completes best-of-3", () => {
 
 test("equal split allocates the remainder deterministically", () => {
   assert.deepEqual([...allocateEqualSplit(101, ["b", "a", "c"]).entries()], [["a", 34], ["b", 34], ["c", 33]]);
+});
+
+test("collection totals group valid methods and ignore non-collections", () => {
+  const totals = collectionTotalsByPlayer([
+    { sessionPlayerId: "alice", kind: "COLLECTION", method: "CASH", amountMinor: 500 },
+    { sessionPlayerId: "alice", kind: "COLLECTION", method: "EWALLET", amountMinor: 250 },
+    { sessionPlayerId: "alice", kind: "COLLECTION", method: "OTHER", amountMinor: 100 },
+    { sessionPlayerId: "alice", kind: "WAIVER", method: null, amountMinor: 999 },
+    { sessionPlayerId: "bob", kind: "COLLECTION", method: "EWALLET", amountMinor: 700 },
+  ]);
+  assert.deepEqual(totals.get("alice"), { CASH: 500, EWALLET: 250, OTHER: 100 });
+  assert.deepEqual(totals.get("bob"), { CASH: 0, EWALLET: 700, OTHER: 0 });
+  assert.equal(totals.has("missing"), false);
 });
 
 test("mixed doubles suggestion returns two players per gendered team", () => {
