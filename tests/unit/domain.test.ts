@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Gender, MatchmakingMode, SessionPlayerStatus, TeamSide } from "@prisma/client";
+import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/client";
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
 import { suggestMatch, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 
 const history = { partners: new Map(), opponents: new Map(), quartets: new Map() };
-const player = (id: string, gender: Gender, skillWeight: number, queueEnteredAt = new Date("2026-01-01T00:00:00Z")): MatchPlayer => ({ id, displayName: id, gender, skillWeight, skillLevel: "BEGINNER", status: SessionPlayerStatus.WAITING, gamesPlayed: 0, queueEnteredAt, lastMatchEndedAt: null, manualPriority: 0 });
+const player = (id: string, gender: Gender, skillWeight: number, queueEnteredAt = new Date("2026-01-01T00:00:00Z")): MatchPlayer => ({ id, displayName: id, gender, skillWeight, skillLevel: "BEGINNER", status: QueuePlayerStatus.WAITING, gamesPlayed: 0, queueEnteredAt, lastMatchEndedAt: null, manualPriority: 0 });
 const pairMap = (...pairs: [string, string, number][]) => new Map(pairs.map(([left, right, value]) => [left, new Map([[right, value]])]));
 
 test("race-to-31 scores require a valid winner", () => {
@@ -35,11 +35,11 @@ test("equal split allocates the remainder deterministically", () => {
 
 test("collection totals group valid methods and ignore non-collections", () => {
   const totals = collectionTotalsByPlayer([
-    { sessionPlayerId: "alice", kind: "COLLECTION", method: "CASH", amountMinor: 500 },
-    { sessionPlayerId: "alice", kind: "COLLECTION", method: "EWALLET", amountMinor: 250 },
-    { sessionPlayerId: "alice", kind: "COLLECTION", method: "OTHER", amountMinor: 100 },
-    { sessionPlayerId: "alice", kind: "WAIVER", method: null, amountMinor: 999 },
-    { sessionPlayerId: "bob", kind: "COLLECTION", method: "EWALLET", amountMinor: 700 },
+    { queuePlayerId: "alice", kind: "COLLECTION", method: "CASH", amountMinor: 500 },
+    { queuePlayerId: "alice", kind: "COLLECTION", method: "EWALLET", amountMinor: 250 },
+    { queuePlayerId: "alice", kind: "COLLECTION", method: "OTHER", amountMinor: 100 },
+    { queuePlayerId: "alice", kind: "WAIVER", method: null, amountMinor: 999 },
+    { queuePlayerId: "bob", kind: "COLLECTION", method: "EWALLET", amountMinor: 700 },
   ]);
   assert.deepEqual(totals.get("alice"), { CASH: 500, EWALLET: 250, OTHER: 100 });
   assert.deepEqual(totals.get("bob"), { CASH: 0, EWALLET: 700, OTHER: 0 });
@@ -52,6 +52,17 @@ test("mixed doubles suggestion returns two players per gendered team", () => {
   assert.equal(result.teamA.length, 2);
   assert.equal(new Set(result.teamA.map((item) => item.gender)).size, 2);
   assert.equal(new Set(result.teamB.map((item) => item.gender)).size, 2);
+});
+
+test("late penalties are minimized before existing fairness rules", () => {
+  const players = ["a", "b", "c", "d", "e"].map((id) => player(id, Gender.MALE, 2));
+  players[4]!.latePenaltyState = "PENDING";
+  const preferred = suggestMatch(players, MatchmakingMode.OPEN, history);
+  assert.ok(preferred);
+  assert.equal([...preferred.teamA, ...preferred.teamB].some((item) => item.id === "e"), false);
+  const required = suggestMatch(players.filter((item) => item.id !== "d"), MatchmakingMode.OPEN, history);
+  assert.ok(required);
+  assert.equal([...required.teamA, ...required.teamB].some((item) => item.id === "e"), true);
 });
 
 test("rotation avoids an exact quartet that has already played together", () => {
@@ -125,14 +136,14 @@ test("history formatting uses the current score revision and calculates duration
   const completedAt = new Date("2026-01-01T00:02:31Z");
   const result = historyMatchView({
     id: "match-1",
-    sessionId: "session-1",
+    queueMasterId: "account-1",
     source: "MANUAL",
     currentRevisionId: "revision-2",
     startedAt,
     completedAt,
     participants: [
-      { sessionPlayerId: "a", team: "A", teamSlot: 1, sessionPlayer: { playerId: "player-a", displayNameSnapshot: "Alice", genderSnapshot: Gender.FEMALE, skillLevelSnapshot: "BEGINNER" } },
-      { sessionPlayerId: "b", team: "B", teamSlot: 1, sessionPlayer: { playerId: "player-b", displayNameSnapshot: "Bob", genderSnapshot: Gender.MALE, skillLevelSnapshot: "INTERMEDIATE" } },
+      { queuePlayerId: "a", team: "A", teamSlot: 1, queuePlayer: { playerId: "player-a", displayNameSnapshot: "Alice", genderSnapshot: Gender.FEMALE, skillLevelSnapshot: "BEGINNER" } },
+      { queuePlayerId: "b", team: "B", teamSlot: 1, queuePlayer: { playerId: "player-b", displayNameSnapshot: "Bob", genderSnapshot: Gender.MALE, skillLevelSnapshot: "INTERMEDIATE" } },
     ],
     scoreRevisions: [
       { id: "revision-1", revisionNumber: 1, winnerTeam: "A", games: [{ gameNumber: 1, teamAScore: 31, teamBScore: 20, winnerTeam: "A" }] },
@@ -151,8 +162,8 @@ test("history formatting uses the current score revision and calculates duration
 
 test("history frequent-player ties resolve by display name", () => {
   const result = chooseFrequentParticipant(new Map([
-    ["b", { sessionPlayerId: "b", displayName: "Zoe", count: 2 }],
-    ["a", { sessionPlayerId: "a", displayName: "Amy", count: 2 }],
+    ["b", { queuePlayerId: "b", displayName: "Zoe", count: 2 }],
+    ["a", { queuePlayerId: "a", displayName: "Amy", count: 2 }],
   ]));
   assert.equal(result?.displayName, "Amy");
 });

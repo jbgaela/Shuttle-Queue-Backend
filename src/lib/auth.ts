@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { CookieOptions, NextFunction, Request, RequestHandler, Response } from "express";
 import argon2 from "argon2";
-import type { QueueMaster } from "@prisma/client";
+import type { AccountRole, QueueMaster } from "@prisma/client";
 import { prisma } from "./db.js";
 import { config } from "./config.js";
 import { AppError, forbidden, unauthorized } from "./errors.js";
@@ -156,6 +156,15 @@ export const requireAuth: RequestHandler = async (request, _response, next: Next
   } catch (error) {
     next(error);
   }
+};
+
+export const requireSuperAdmin: RequestHandler = (request, _response, next) => {
+  const auth = (request as AuthenticatedRequest).auth;
+  if (!auth || auth.queueMaster.role !== ("SUPER_ADMIN" satisfies AccountRole)) {
+    next(forbidden("Super Admin access is required."));
+    return;
+  }
+  next();
 };
 
 export const requireMutationOrigin: RequestHandler = (request, _response, next) => {

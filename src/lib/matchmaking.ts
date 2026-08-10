@@ -1,4 +1,4 @@
-import { Gender, MatchmakingMode, SessionPlayerStatus } from "@prisma/client";
+import { Gender, MatchmakingMode, QueuePlayerStatus } from "@prisma/client";
 
 export type MatchPlayer = {
   id: string;
@@ -6,11 +6,13 @@ export type MatchPlayer = {
   gender: Gender;
   skillWeight: number;
   skillLevel: string;
-  status: SessionPlayerStatus;
+  status: QueuePlayerStatus;
   gamesPlayed: number;
   queueEnteredAt: Date | null;
   lastMatchEndedAt: Date | null;
   manualPriority: number;
+  latePenaltyState?: "PENDING" | "SERVED" | "WAIVED" | null;
+  latePenaltyAppliedAt?: Date | null;
 };
 
 type PairMap = Map<string, Map<string, number>>;
@@ -106,7 +108,7 @@ function skillMix(team: MatchPlayer[]) {
 }
 
 export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, history: MatchHistory, excludedKeys: string[] = []): Suggestion | null {
-  const eligible = players.filter((player) => player.status === SessionPlayerStatus.WAITING && player.queueEnteredAt);
+  const eligible = players.filter((player) => player.status === QueuePlayerStatus.WAITING && player.queueEnteredAt);
   const excluded = new Set(excludedKeys);
   const minimumGames = eligible.length ? Math.min(...eligible.map((player) => player.gamesPlayed)) : 0;
   let best: { key: (number[] | number | string)[]; suggestion: Suggestion } | null = null;
@@ -118,9 +120,12 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
     if (mode === MatchmakingMode.SAME_SKILL && new Set(quartet.map((player) => player.skillWeight)).size !== 1) return false;
     return true;
   });
-  const fairnessQuartets = modeEligibleQuartets.filter((quartet) => Math.max(...quartet.map((player) => player.gamesPlayed)) <= minimumGames + 1);
-  const hasManualOverride = modeEligibleQuartets.some((quartet) => quartet.some((player) => player.manualPriority > 0));
-  const candidateQuartets = hasManualOverride ? modeEligibleQuartets : fairnessQuartets.length ? fairnessQuartets : modeEligibleQuartets;
+  const minimumPending = modeEligibleQuartets.length ? Math.min(...modeEligibleQuartets.map((quartet) => quartet.filter((player) => player.latePenaltyState === "PENDING").length)) : 0;
+  const latePreferredQuartets = modeEligibleQuartets.filter((quartet) => quartet.filter((player) => player.latePenaltyState === "PENDING").length === minimumPending);
+  const candidateMinimumGames = latePreferredQuartets.length ? Math.min(...latePreferredQuartets.flatMap((quartet) => quartet.map((player) => player.gamesPlayed))) : minimumGames;
+  const fairnessQuartets = latePreferredQuartets.filter((quartet) => Math.max(...quartet.map((player) => player.gamesPlayed)) <= candidateMinimumGames + 1);
+  const hasManualOverride = latePreferredQuartets.some((quartet) => quartet.some((player) => player.manualPriority > 0));
+  const candidateQuartets = hasManualOverride ? latePreferredQuartets : fairnessQuartets.length ? fairnessQuartets : latePreferredQuartets;
 
   for (const quartet of candidateQuartets) {
     const skillSpread = Math.max(...quartet.map((player) => player.skillWeight)) - Math.min(...quartet.map((player) => player.skillWeight));
@@ -129,7 +134,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
     const quartetId = quartetKey(quartet);
     const recentQuartetRepeats = history.recentQuartets?.get(quartetId) ?? 0;
     const allTimeQuartetRepeats = history.quartets.get(quartetId) ?? 0;
-    const lowestGamesCount = quartet.filter((player) => player.gamesPlayed === minimumGames).length;
+    const lowestGamesCount = quartet.filter((player) => player.gamesPlayed === candidateMinimumGames).length;
     const sortedPlayers = [...quartet].sort((a, b) => a.id.localeCompare(b.id));
 
     for (const partition of partitions(sortedPlayers)) {
@@ -194,7 +199,8 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
             allTimePartnerRepeats,
           },
           partnerRotation: { recentRepeats: recentPartnerRepeats, allTimeRepeats: allTimePartnerRepeats, preservedTeamBalance: true },
-          fairness: { minimumGames, minimumGamesCount: lowestGamesCount, manualOverride: hasManualOverride },
+          lateArrival: { minimumPending, selectedPending: quartet.filter((player) => player.latePenaltyState === "PENDING").length, preferenceApplied: minimumPending > 0 || quartet.some((player) => player.latePenaltyState === "PENDING") },
+          fairness: { minimumGames: candidateMinimumGames, minimumGamesCount: lowestGamesCount, manualOverride: hasManualOverride },
           fallback: null,
         },
       };

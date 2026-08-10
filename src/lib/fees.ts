@@ -2,13 +2,13 @@ export type FeeMode = "FIXED_PER_PLAYER" | "EQUAL_SPLIT";
 
 export type CollectionMethodTotals = { CASH: number; EWALLET: number; OTHER: number };
 
-export function collectionTotalsByPlayer(payments: ReadonlyArray<{ sessionPlayerId: string; kind: string; method?: string | null; amountMinor: number }>) {
+export function collectionTotalsByPlayer(payments: ReadonlyArray<{ queuePlayerId: string; kind: string; method?: string | null; amountMinor: number }>) {
   const totals = new Map<string, CollectionMethodTotals>();
   for (const payment of payments) {
     if (payment.kind !== "COLLECTION" || (payment.method !== "CASH" && payment.method !== "EWALLET" && payment.method !== "OTHER")) continue;
-    const current = totals.get(payment.sessionPlayerId) ?? { CASH: 0, EWALLET: 0, OTHER: 0 };
+    const current = totals.get(payment.queuePlayerId) ?? { CASH: 0, EWALLET: 0, OTHER: 0 };
     current[payment.method] += payment.amountMinor;
-    totals.set(payment.sessionPlayerId, current);
+    totals.set(payment.queuePlayerId, current);
   }
   return totals;
 }

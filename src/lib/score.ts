@@ -14,7 +14,7 @@ export type ValidatedScore = ScoreInput & { winnerTeam: TeamSide };
 
 export function validateScores(games: ScoreInput[], settings: ScoreSettings): ValidatedScore[] {
   if (!Array.isArray(games) || games.length === 0 || games.length > settings.bestOf) {
-    throw badRequest("The number of games does not match the session scoring rules.");
+    throw badRequest("The number of games does not match the queue scoring rules.");
   }
   const requiredWins = Math.floor(settings.bestOf / 2) + 1;
   let aWins = 0;
@@ -33,7 +33,7 @@ export function validateScores(games: ScoreInput[], settings: ScoreSettings): Va
     }
     const reachesCap = settings.scoreCap !== null && high === settings.scoreCap;
     const validRace = reachesCap ? high === settings.scoreCap && low < high : high >= settings.pointsToWin && high - low >= settings.winBy;
-    if (!validRace) throw badRequest("The submitted score does not satisfy the session rules.");
+    if (!validRace) throw badRequest("The submitted score does not satisfy the queue rules.");
     const winnerTeam = game.teamAScore > game.teamBScore ? TeamSide.A : TeamSide.B;
     validated.push({ ...game, winnerTeam });
     if (winnerTeam === TeamSide.A) aWins += 1;
@@ -44,4 +44,3 @@ export function validateScores(games: ScoreInput[], settings: ScoreSettings): Va
   if (validated.length !== games.length) throw badRequest("No games may be submitted after the match is already won.");
   return validated;
 }
-
