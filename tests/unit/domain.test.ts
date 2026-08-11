@@ -160,6 +160,21 @@ test("history formatting uses the current score revision and calculates duration
   assert.equal(historyDurationSeconds({ startedAt, completedAt: null }), null);
 });
 
+test("history formatting preserves a deleted court snapshot", () => {
+  const result = historyMatchView({
+    id: "match-deleted-court",
+    source: "MANUAL",
+    court: null,
+    courtIdSnapshot: "court-old",
+    courtNameSnapshot: "Court North",
+    startedAt: new Date("2026-01-01T00:00:00Z"),
+    completedAt: new Date("2026-01-01T00:02:00Z"),
+    participants: [],
+    scoreRevisions: [],
+  });
+  assert.deepEqual(result.court, { id: "court-old", name: "Court North" });
+});
+
 test("history frequent-player ties resolve by display name", () => {
   const result = chooseFrequentParticipant(new Map([
     ["b", { queuePlayerId: "b", displayName: "Zoe", count: 2 }],

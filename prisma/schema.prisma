@@ -306,6 +306,8 @@ model Match {
   queueMaster            QueueMaster         @relation(fields: [queueMasterId], references: [id])
   courtId               String?
   court                 Court?              @relation("MatchCourt", fields: [courtId], references: [id])
+  courtIdSnapshot       String?
+  courtNameSnapshot     String?
   status                MatchStatus         @default(QUEUED)
   source                MatchSource
   matchmakingMode       MatchmakingMode?
