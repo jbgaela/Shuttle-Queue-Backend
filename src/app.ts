@@ -15,6 +15,7 @@ import { AppError, badRequest, conflict, forbidden, notFound, unauthorized } fro
 import { normalizeName, normalizeText, normalizeUsername } from "./lib/normalize.js";
 import { skillWeight } from "./lib/skills.js";
 import { allocateEqualSplit, collectionTotalsByPlayer } from "./lib/fees.js";
+import { allowedQueueStatuses, queueActionData } from "./lib/queue-actions.js";
 import { suggestMatch, type MatchHistory, type MatchPlayer } from "./lib/matchmaking.js";
 import { validateScores, type ScoreInput } from "./lib/score.js";
 import { clearLoginFailures, clearSessionCookie, currentCsrfToken, issueSession, passwordHash, recordLoginFailure, requireAuth, requireMutationOrigin, requireSuperAdmin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
@@ -278,6 +279,27 @@ api.post("/players/delete", requireAuth, requireMutationOrigin, route(async (req
 
 api.get("/queue/players", requireAuth, route(async (request, response) => { await ensureWorkspace(authUser(request).id); responseData(response, (await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id }, orderBy: [{ status: "asc" }, { queueEnteredAt: "asc" }] })).map(queuePlayerView)); }));
 api.post("/queue/players", requireAuth, requireMutationOrigin, route(async (request, response) => { const body = parse(z.object({ playerIds: z.array(idSchema).min(1).max(100) }), request.body); const ids = [...new Set(body.playerIds)]; const roster = await db.player.findMany({ where: { id: { in: ids }, queueMasterId: authUser(request).id, status: PlayerStatus.ACTIVE } }); if (roster.length !== ids.length) throw conflict("PLAYER_INELIGIBLE", "Every selected player must be active and owned by you."); const existing = await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id, playerId: { in: ids } } }); if (existing.length) throw conflict("PLAYER_ALREADY_IN_QUEUE", "One or more players are already in the queue."); const rows = await db.$transaction((tx: any) => Promise.all(roster.map((player: any) => tx.queuePlayer.create({ data: { queueMasterId: authUser(request).id, playerId: player.id, displayNameSnapshot: player.displayName, normalizedNameSnapshot: player.normalizedName, genderSnapshot: player.gender, skillLevelSnapshot: player.skillLevel, skillWeightSnapshot: player.skillWeight } })))); responseData(response, rows.map(queuePlayerView), 201); }));
+api.post("/queue/players/bulk-action", requireAuth, requireMutationOrigin, route(async (request, response) => {
+  const body = parse(z.object({ playerIds: z.array(idSchema).min(1).max(100), action: z.enum(["CHECK_IN", "REST", "CHECK_OUT"]) }), request.body);
+  const ids = [...new Set(body.playerIds)];
+  if (ids.length !== body.playerIds.length) throw conflict("INVALID_PLAYER_SELECTION", "Each player can only be selected once.");
+  const workspace = await activeWorkspaceFor(request);
+  const queueMasterId = authUser(request).id;
+  const updated = await withTransactionRetry(async (tx) => {
+    const players = await tx.queuePlayer.findMany({ where: { id: { in: ids }, queueMasterId } });
+    if (players.length !== ids.length) throw conflict("PLAYER_NOT_FOUND", "One or more selected players could not be found.");
+    const allowed: string[] = allowedQueueStatuses(body.action);
+    const invalid = players.filter((player: any) => !allowed.includes(player.status));
+    if (invalid.length) throw conflict("INVALID_PLAYER_TRANSITION", "One or more selected players are no longer eligible for this action.", { playerIds: invalid.map((player: any) => player.id) });
+    const changedAt = new Date();
+    await Promise.all(players.map((player: any) => {
+      const data = queueActionData(player, body.action, changedAt, workspace?.lateArrivalCutoffAt) as any;
+      return tx.queuePlayer.update({ where: { id: player.id }, data: { ...data, version: { increment: 1 } } });
+    }));
+    return tx.queuePlayer.findMany({ where: { id: { in: ids }, queueMasterId } });
+  });
+  responseData(response, updated.map(queuePlayerView));
+}));
 api.post("/queue/players/:id/check-in", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (![QueuePlayerStatus.INACTIVE, QueuePlayerStatus.CHECKED_OUT].includes(player.status)) throw conflict("INVALID_PLAYER_TRANSITION", "The player cannot be checked in from the current state."); const workspace = await workspaceFor(request); const checkedInAt = new Date(); const late = Boolean(workspace.lateArrivalCutoffAt && checkedInAt > workspace.lateArrivalCutoffAt && !player.latePenaltyState); const updated = await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.WAITING, checkedInAt: player.checkedInAt ?? checkedInAt, checkedOutAt: null, queueEnteredAt: checkedInAt, ...(late ? { latePenaltyState: LatePenaltyState.PENDING, latePenaltyAppliedAt: checkedInAt } : {}), version: { increment: 1 } } }); responseData(response, queuePlayerView(updated)); }));
 api.post("/queue/players/:id/rest", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (player.status !== QueuePlayerStatus.WAITING) throw conflict("INVALID_PLAYER_TRANSITION", "Only waiting players can rest."); responseData(response, queuePlayerView(await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.RESTING, restStartedAt: new Date(), version: { increment: 1 } } }))); }));
 api.post("/queue/players/:id/resume", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (player.status !== QueuePlayerStatus.RESTING) throw conflict("INVALID_PLAYER_TRANSITION", "Only resting players can resume."); responseData(response, queuePlayerView(await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.WAITING, restStartedAt: null, queueEnteredAt: new Date(), version: { increment: 1 } } }))); }));

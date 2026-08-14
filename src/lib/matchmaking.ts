@@ -112,6 +112,12 @@ function skillMix(team: MatchPlayer[]) {
 export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, history: MatchHistory, excludedKeys: string[] = []): Suggestion | null {
   const eligible = players.filter((player) => player.status === QueuePlayerStatus.WAITING && player.queueEnteredAt);
   const excluded = new Set(excludedKeys);
+  const previousSuggestionPlayerIds = new Set(
+    mode === MatchmakingMode.BALANCED && excludedKeys.length > 0 && !eligible.some((player) => player.latePenaltyState === "PENDING")
+      ? excludedKeys[excludedKeys.length - 1]!.split(/[|,]/).filter(Boolean)
+      : [],
+  );
+  const previouslySkippedPlayerIds = new Set(previousSuggestionPlayerIds.size > 0 ? eligible.filter((player) => !previousSuggestionPlayerIds.has(player.id)).map((player) => player.id) : []);
   const minimumGames = eligible.length ? Math.min(...eligible.map((player) => player.gamesPlayed)) : 0;
   let best: { key: (number[] | number | string)[]; suggestion: Suggestion } | null = null;
 
@@ -159,8 +165,10 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
       const gamesSpread = games[games.length - 1]! - games[0]!;
       const times = sortedTimes(quartet);
       const quartetKeyString = sortedPlayers.map((player) => player.id).join(",");
+      const previouslySkippedCount = quartet.filter((player) => previouslySkippedPlayerIds.has(player.id)).length;
       const key: (number[] | number | string)[] = [
         priority,
+        -previouslySkippedCount,
         -lowestGamesCount,
         gamesSpread,
         recentPairs.repeatedPairs,
@@ -204,7 +212,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
           },
           partnerRotation: { recentRepeats: recentPartnerRepeats, allTimeRepeats: allTimePartnerRepeats, preservedTeamBalance: true },
           lateArrival: { minimumPending, selectedPending: quartet.filter((player) => player.latePenaltyState === "PENDING").length, preferenceApplied: minimumPending > 0 || quartet.some((player) => player.latePenaltyState === "PENDING") },
-          fairness: { minimumGames: candidateMinimumGames, minimumGamesCount: lowestGamesCount, manualOverride: hasManualOverride },
+          fairness: { minimumGames: candidateMinimumGames, minimumGamesCount: lowestGamesCount, manualOverride: hasManualOverride, previouslySkippedCount },
           fallback: null,
         },
       };

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/client";
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
+import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
 import { suggestMatch, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
@@ -33,6 +34,16 @@ test("score validation rejects ties and caps, and completes best-of-3", () => {
 
 test("equal split allocates the remainder deterministically", () => {
   assert.deepEqual([...allocateEqualSplit(101, ["b", "a", "c"]).entries()], [["a", 34], ["b", 34], ["c", 33]]);
+});
+
+test("bulk queue actions preserve first check-in and apply one batch timestamp", () => {
+  const changedAt = new Date("2026-02-01T10:00:00Z");
+  const firstCheckIn = new Date("2026-01-01T10:00:00Z");
+  assert.deepEqual(allowedQueueStatuses("CHECK_IN"), ["INACTIVE", "CHECKED_OUT"]);
+  assert.deepEqual(queueActionData({ checkedInAt: firstCheckIn, latePenaltyState: null }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: firstCheckIn, checkedOutAt: null, queueEnteredAt: changedAt, latePenaltyState: "PENDING", latePenaltyAppliedAt: changedAt });
+  assert.deepEqual(queueActionData({ checkedInAt: null, latePenaltyState: "WAIVED" }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: changedAt, checkedOutAt: null, queueEnteredAt: changedAt });
+  assert.deepEqual(queueActionData({}, "REST", changedAt), { status: "RESTING", restStartedAt: changedAt });
+  assert.deepEqual(queueActionData({}, "CHECK_OUT", changedAt), { status: "CHECKED_OUT", checkedOutAt: changedAt, queueEnteredAt: null });
 });
 
 test("collection totals group valid methods and ignore non-collections", () => {
@@ -128,6 +139,29 @@ test("balanced mode keeps player and team strength gaps within one", () => {
   ], MatchmakingMode.BALANCED, history);
   assert.ok(boundary);
   assert.equal(boundary.difference, 1);
+});
+
+test("balanced suggestions prioritize players skipped by the previous lineup", () => {
+  const players = ["a", "b", "c", "d", "e", "f"].map((id) => player(id, Gender.MALE, 2));
+  const first = suggestMatch(players, MatchmakingMode.BALANCED, history);
+  assert.ok(first);
+  const firstIds = new Set([...first.teamA, ...first.teamB].map((item) => item.id));
+  const skippedIds = players.filter((item) => !firstIds.has(item.id)).map((item) => item.id);
+
+  const next = suggestMatch(players, MatchmakingMode.BALANCED, history, [first.key]);
+  assert.ok(next);
+  const nextIds = new Set([...next.teamA, ...next.teamB].map((item) => item.id));
+  assert.equal(skippedIds.every((id) => nextIds.has(id)), true);
+  assert.equal((next.explanation.fairness as { previouslySkippedCount: number }).previouslySkippedCount, skippedIds.length);
+});
+
+test("pending late penalties disable skipped-player priority for balanced suggestions", () => {
+  const players = ["a", "b", "c", "d", "e", "f"].map((id) => player(id, Gender.MALE, 2));
+  players[5]!.latePenaltyState = "PENDING";
+  const result = suggestMatch(players, MatchmakingMode.BALANCED, history, ["a,b|c,d"]);
+  assert.ok(result);
+  assert.deepEqual([...result.teamA, ...result.teamB].map((item) => item.id).sort(), ["a", "b", "c", "d"]);
+  assert.equal((result.explanation.fairness as { previouslySkippedCount: number }).previouslySkippedCount, 0);
 });
 
 test("balanced mode rejects distant player levels even when team totals can tie", () => {
