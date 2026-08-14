@@ -109,18 +109,67 @@ test("recent partner repeats outrank older all-time repeats", () => {
   assert.equal(result.teamB.some((item) => item.id === "a") && result.teamB.some((item) => item.id === "b"), false);
 });
 
-test("balanced mode mixes stronger and weaker partners when team totals are equal", () => {
+test("balanced mode keeps player and team strength gaps within one", () => {
   const result = suggestMatch([
+    player("a", Gender.MALE, 2),
+    player("b", Gender.MALE, 2),
+    player("c", Gender.MALE, 3),
+    player("d", Gender.MALE, 3),
+  ], MatchmakingMode.BALANCED, history);
+  assert.ok(result);
+  assert.ok(result.difference <= 1);
+  assert.ok(Math.max(...[...result.teamA, ...result.teamB].map((item) => item.skillWeight)) - Math.min(...[...result.teamA, ...result.teamB].map((item) => item.skillWeight)) <= 1);
+
+  const boundary = suggestMatch([
+    player("a", Gender.MALE, 2),
+    player("b", Gender.MALE, 2),
+    player("c", Gender.MALE, 2),
+    player("d", Gender.MALE, 3),
+  ], MatchmakingMode.BALANCED, history);
+  assert.ok(boundary);
+  assert.equal(boundary.difference, 1);
+});
+
+test("balanced mode rejects distant player levels even when team totals can tie", () => {
+  assert.equal(suggestMatch([
+    player("a", Gender.MALE, 1),
+    player("b", Gender.MALE, 1),
+    player("c", Gender.MALE, 3),
+    player("d", Gender.MALE, 3),
+  ], MatchmakingMode.BALANCED, history), null);
+  assert.equal(suggestMatch([
     player("a", Gender.MALE, 1),
     player("b", Gender.MALE, 1),
     player("c", Gender.MALE, 5),
     player("d", Gender.MALE, 5),
-  ], MatchmakingMode.BALANCED, history);
+  ], MatchmakingMode.BALANCED, history), null);
+  assert.ok(suggestMatch([
+    player("a", Gender.MALE, 1),
+    player("b", Gender.MALE, 1),
+    player("c", Gender.MALE, 3),
+    player("d", Gender.MALE, 3),
+  ], MatchmakingMode.OPEN, history));
+});
+
+test("balanced eligibility is evaluated before late penalties and exclusions", () => {
+  const players = [
+    player("a", Gender.MALE, 1),
+    player("b", Gender.MALE, 1),
+    player("c", Gender.MALE, 1),
+    player("d", Gender.MALE, 4),
+    player("e", Gender.MALE, 2),
+  ];
+  players[4]!.latePenaltyState = "PENDING";
+  const result = suggestMatch(players, MatchmakingMode.BALANCED, history);
   assert.ok(result);
-  assert.equal(result.teamATotal, 6);
-  assert.equal(result.teamBTotal, 6);
-  assert.equal(new Set(result.teamA.map((item) => item.skillWeight)).size, 2);
-  assert.equal(new Set(result.teamB.map((item) => item.skillWeight)).size, 2);
+  assert.equal([...result.teamA, ...result.teamB].some((item) => item.id === "e"), true);
+  assert.ok(result.difference <= 1);
+  assert.equal(suggestMatch([
+    player("a", Gender.MALE, 2),
+    player("b", Gender.MALE, 2),
+    player("c", Gender.MALE, 3),
+    player("d", Gender.MALE, 3),
+  ], MatchmakingMode.BALANCED, history, ["a,c|b,d", "a,d|b,c"]), null);
 });
 
 test("same-skill mode keeps hard eligibility and exclusions cycle through another split", () => {

@@ -39,6 +39,8 @@ export type Suggestion = {
   explanation: Record<string, unknown>;
 };
 
+const MAX_BALANCED_STRENGTH_GAP = 1;
+
 const count = (map: PairMap | undefined, a: string, b: string) => map?.get(a)?.get(b) ?? 0;
 const symmetricCount = (map: PairMap | undefined, a: string, b: string) => Math.max(count(map, a, b), count(map, b, a));
 const quartetKey = (players: MatchPlayer[]) => players.map((player) => player.id).sort().join(":");
@@ -118,6 +120,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
     if (mode === MatchmakingMode.SAME_GENDER && genders.size !== 1) return false;
     if (mode === MatchmakingMode.MIXED_DOUBLES && (genders.size !== 2 || quartet.filter((player) => player.gender === Gender.MALE).length !== 2)) return false;
     if (mode === MatchmakingMode.SAME_SKILL && new Set(quartet.map((player) => player.skillWeight)).size !== 1) return false;
+    if (mode === MatchmakingMode.BALANCED && Math.max(...quartet.map((player) => player.skillWeight)) - Math.min(...quartet.map((player) => player.skillWeight)) > MAX_BALANCED_STRENGTH_GAP) return false;
     return true;
   });
   const minimumPending = modeEligibleQuartets.length ? Math.min(...modeEligibleQuartets.map((quartet) => quartet.filter((player) => player.latePenaltyState === "PENDING").length)) : 0;
@@ -144,6 +147,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
       const teamATotal = teamA.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamBTotal = teamB.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamDifference = Math.abs(teamATotal - teamBTotal);
+      if (mode === MatchmakingMode.BALANCED && teamDifference > MAX_BALANCED_STRENGTH_GAP) continue;
       const recentPartnerRepeats = partnerRepeats(history, teamA, true) + partnerRepeats(history, teamB, true);
       const allTimePartnerRepeats = partnerRepeats(history, teamA, false) + partnerRepeats(history, teamB, false);
       const partnerMix = skillMix(teamA) + skillMix(teamB);
