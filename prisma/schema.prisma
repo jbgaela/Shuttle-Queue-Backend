@@ -161,6 +161,7 @@ model QueueWorkspace {
   queueMasterId          String      @id @map("_id")
   queueMaster            QueueMaster @relation(fields: [queueMasterId], references: [id])
   startedAt              DateTime    @default(now())
+  endedAt                DateTime?
   lateArrivalCutoffAt    DateTime?
   matchmakingAlgorithm   String      @default("v2-rotation")
   matchmakingRevision    Int         @default(1)

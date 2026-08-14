@@ -13,6 +13,7 @@ const pairMap = (...pairs: [string, string, number][]) => new Map(pairs.map(([le
 test("race-to-31 scores require a valid winner", () => {
   const result = validateScores([{ teamAScore: 31, teamBScore: 29 }], { pointsToWin: 31, winBy: 1, scoreCap: 31, bestOf: 1 });
   assert.equal(result[0]?.winnerTeam, TeamSide.A);
+  assert.equal(validateScores([{ teamAScore: 31, teamBScore: 29 }], { pointsToWin: 31, winBy: 1, scoreCap: null, bestOf: 1 })[0]?.winnerTeam, TeamSide.A);
   assert.throws(() => validateScores([{ teamAScore: 30, teamBScore: 29 }], { pointsToWin: 31, winBy: 1, scoreCap: 31, bestOf: 1 }));
 });
 
@@ -27,6 +28,7 @@ test("score validation rejects ties and caps, and completes best-of-3", () => {
   assert.equal(result[2]?.winnerTeam, TeamSide.A);
   assert.throws(() => validateScores([{ teamAScore: 31, teamBScore: 31 }], { ...settings, bestOf: 1 }));
   assert.throws(() => validateScores([{ teamAScore: 32, teamBScore: 30 }], { ...settings, bestOf: 1 }));
+  assert.throws(() => validateScores([{ teamAScore: 32, teamBScore: 30 }], { ...settings, scoreCap: null }));
 });
 
 test("equal split allocates the remainder deterministically", () => {
