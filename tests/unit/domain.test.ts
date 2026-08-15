@@ -6,6 +6,7 @@ import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actio
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
 import { suggestMatch, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
+import { datePartsForInstant, instantForLocalDateTime } from "../../src/lib/timezone.js";
 
 const history = { partners: new Map(), opponents: new Map(), quartets: new Map() };
 const player = (id: string, gender: Gender, skillWeight: number, queueEnteredAt = new Date("2026-01-01T00:00:00Z")): MatchPlayer => ({ id, displayName: id, gender, skillWeight, skillLevel: "BEGINNER", status: QueuePlayerStatus.WAITING, gamesPlayed: 0, queueEnteredAt, lastMatchEndedAt: null, manualPriority: 0 });
@@ -41,9 +42,16 @@ test("bulk queue actions preserve first check-in and apply one batch timestamp",
   const firstCheckIn = new Date("2026-01-01T10:00:00Z");
   assert.deepEqual(allowedQueueStatuses("CHECK_IN"), ["INACTIVE", "CHECKED_OUT"]);
   assert.deepEqual(queueActionData({ checkedInAt: firstCheckIn, latePenaltyState: null }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: firstCheckIn, checkedOutAt: null, queueEnteredAt: changedAt, latePenaltyState: "PENDING", latePenaltyAppliedAt: changedAt });
+  assert.deepEqual(queueActionData({ checkedInAt: null, latePenaltyState: null }, "CHECK_IN", changedAt, changedAt), { status: "WAITING", checkedInAt: changedAt, checkedOutAt: null, queueEnteredAt: changedAt });
   assert.deepEqual(queueActionData({ checkedInAt: null, latePenaltyState: "WAIVED" }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: changedAt, checkedOutAt: null, queueEnteredAt: changedAt });
   assert.deepEqual(queueActionData({}, "REST", changedAt), { status: "RESTING", restStartedAt: changedAt });
   assert.deepEqual(queueActionData({}, "CHECK_OUT", changedAt), { status: "CHECKED_OUT", checkedOutAt: changedAt, queueEnteredAt: null });
+});
+
+test("late-arrival wall clocks use the account timezone across UTC date boundaries", () => {
+  assert.equal(datePartsForInstant(new Date("2026-08-14T17:00:00.000Z"), "Asia/Manila"), "2026-08-15");
+  assert.equal(instantForLocalDateTime("2026-08-15T22:00", "Asia/Manila").toISOString(), "2026-08-15T14:00:00.000Z");
+  assert.equal(instantForLocalDateTime("2026-08-15T00:00", "Asia/Manila").toISOString(), "2026-08-14T16:00:00.000Z");
 });
 
 test("collection totals group valid methods and ignore non-collections", () => {
