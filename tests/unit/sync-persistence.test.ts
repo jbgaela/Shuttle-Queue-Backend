@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
-import { assertStableNaturalKeys, reconcileSyncSnapshot, validateSyncSnapshot } from "../../src/lib/sync-persistence.js";
+import { assertStableNaturalKeys, persistSyncSnapshot, reconcileSyncSnapshot, validateSyncSnapshot } from "../../src/lib/sync-persistence.js";
 
 const snapshot = (): CloudSnapshotV2 => ({
   schemaVersion: 2,
@@ -41,6 +41,53 @@ test("reports same-natural-key records with a different offline id", async () =>
     matchGame: { findMany: async () => [] },
   };
   await assert.rejects(() => assertStableNaturalKeys(tx, "account-1", snapshot()), (error: any) => error.code === "SYNC_IDENTITY_CONFLICT" && error.details.entity === "player");
+});
+
+test("replays the same operation without reconciling records twice", async () => {
+  let claimCalls = 0;
+  const state = { id: "sync-1", cloudRevision: 4, version: 2, lastDeviceId: "device-1", lastOperationId: "operation-1" };
+  const tx: any = { accountSyncState: { upsert: async () => state, updateMany: async () => { claimCalls += 1; return { count: 1 }; }, findUnique: async () => state } };
+  const result = await persistSyncSnapshot(tx, { schemaVersion: 2, deviceId: "device-1", operationId: "operation-1", baseCloudRevision: 4, force: false, snapshot: snapshot(), auditEvents: [] }, "account-1");
+  assert.equal(result.alreadyApplied, true);
+  assert.equal(result.state.cloudRevision, 4);
+  assert.equal(claimCalls, 0);
+});
+
+test("claims the revision before writing reconciled records", async () => {
+  const calls: string[] = [];
+  const state: any = { id: "sync-1", cloudRevision: 4, version: 2, lastDeviceId: null, lastOperationId: null };
+  const model = (ids: string[] = []) => ({
+    findMany: async () => ids.map((id) => ({ id })),
+    update: async () => { calls.push("update"); return {}; },
+    create: async () => { calls.push("create"); return {}; },
+    deleteMany: async () => { calls.push("delete"); return {}; },
+  });
+  const tx: any = {
+    accountSyncState: {
+      upsert: async () => state,
+      updateMany: async () => { calls.push("claim"); state.cloudRevision += 1; state.version += 1; return { count: 1 }; },
+      findUnique: async () => state,
+    },
+    player: { findMany: async ({ select }: any) => select?.displayName ? [{ id: "player-1", displayName: "Alice" }] : [{ id: "player-1" }], update: async () => { calls.push("update"); return {}; }, create: async () => { calls.push("create"); return {}; }, deleteMany: async () => { calls.push("delete"); return {}; } },
+    queuePlayer: model(), court: model(), match: model(), matchParticipant: model(), matchScoreRevision: model(), matchGame: model(), payment: model(),
+    queueWorkspace: { update: async () => ({}) }, queueFeeConfig: { deleteMany: async () => ({}) }, auditLog: { create: async () => ({}) },
+  };
+  const result = await persistSyncSnapshot(tx, { schemaVersion: 2, deviceId: "device-1", operationId: "operation-2", baseCloudRevision: 4, force: false, snapshot: snapshot(), auditEvents: [] }, "account-1");
+  assert.equal(result.alreadyApplied, false);
+  assert.equal(calls[0], "claim");
+  assert.equal(state.cloudRevision, 5);
+});
+
+test("rejects a different operation using a stale base revision", async () => {
+  let claimCalls = 0;
+  const tx: any = {
+    accountSyncState: {
+      upsert: async () => ({ id: "sync-1", cloudRevision: 5, version: 3, lastDeviceId: "device-1", lastOperationId: "operation-1" }),
+      updateMany: async () => { claimCalls += 1; return { count: 1 }; },
+    },
+  };
+  await assert.rejects(() => persistSyncSnapshot(tx, { schemaVersion: 2, deviceId: "device-2", operationId: "operation-2", baseCloudRevision: 4, force: false, snapshot: snapshot(), auditEvents: [] }, "account-1"), (error: any) => error.code === "SYNC_CLOUD_CHANGED");
+  assert.equal(claimCalls, 0);
 });
 
 test("updates existing records and deletes stale records without recreating them", async () => {

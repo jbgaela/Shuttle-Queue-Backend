@@ -190,10 +190,29 @@ export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: str
 }
 
 export async function persistSyncSnapshot(tx: SyncDatabase, upload: SyncUpload, queueMasterId: string) {
+  const state = await tx.accountSyncState.upsert({ where: { queueMasterId }, create: { queueMasterId, schemaVersion: 2 }, update: {} });
+  if (state.lastDeviceId === upload.deviceId && state.lastOperationId === upload.operationId) return { state, alreadyApplied: true };
+  if (!upload.force && state.cloudRevision !== upload.baseCloudRevision) throw conflict("SYNC_CLOUD_CHANGED", "Cloud data changed on another device.", { cloudRevision: state.cloudRevision });
   validateSyncSnapshot(upload.snapshot);
   await assertStableNaturalKeys(tx, queueMasterId, upload.snapshot);
-  const state = await tx.accountSyncState.upsert({ where: { queueMasterId }, create: { queueMasterId, schemaVersion: 2 }, update: {} });
-  if (!upload.force && state.cloudRevision !== upload.baseCloudRevision) throw conflict("SYNC_CLOUD_CHANGED", "Cloud data changed on another device.", { cloudRevision: state.cloudRevision });
+  const claimed = await tx.accountSyncState.updateMany({
+    where: {
+      id: state.id,
+      version: state.version,
+      ...(upload.force ? {} : { cloudRevision: upload.baseCloudRevision }),
+    },
+    data: {
+      cloudRevision: { increment: 1 },
+      schemaVersion: 2,
+      lastDeviceId: upload.deviceId,
+      lastOperationId: upload.operationId,
+      lastSyncedAt: new Date(),
+      version: { increment: 1 },
+    },
+  });
+  if (claimed.count !== 1) throw conflict("SYNC_CLOUD_CHANGED", "Cloud data changed on another device.", { cloudRevision: state.cloudRevision });
   await reconcileSyncSnapshot(tx, queueMasterId, upload.snapshot, upload.auditEvents, upload.operationId);
-  return tx.accountSyncState.update({ where: { queueMasterId }, data: { cloudRevision: { increment: 1 }, schemaVersion: 2, lastDeviceId: upload.deviceId, lastOperationId: upload.operationId, lastSyncedAt: new Date(), version: { increment: 1 } } });
+  const updated = await tx.accountSyncState.findUnique({ where: { id: state.id } });
+  if (!updated) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the snapshot was being saved.");
+  return { state: updated, alreadyApplied: false };
 }

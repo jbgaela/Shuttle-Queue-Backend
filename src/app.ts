@@ -458,11 +458,14 @@ api.put("/sync/snapshot", requireAuth, requireMutationOrigin, route(async (reque
   if (snapshot.queueMasterId !== authUser(request).id || snapshot.schemaVersion !== 2) throw badRequest("The snapshot is not valid for this account.");
   try {
     const result = await withTransactionRetry((tx) => persistSyncSnapshot(tx, { ...body, snapshot } as SyncUpload, authUser(request).id), { maxWait: 10_000, timeout: 30_000 });
-    responseData(response, { cloudRevision: result.cloudRevision, lastSyncedAt: result.lastSyncedAt, schemaVersion: 2, alreadyApplied: false });
+    responseData(response, { cloudRevision: result.state.cloudRevision, lastSyncedAt: result.state.lastSyncedAt, schemaVersion: 2, alreadyApplied: result.alreadyApplied });
   } catch (error) {
     if (isUniqueConstraintError(error)) {
-      const target = error instanceof Prisma.PrismaClientKnownRequestError && Array.isArray(error.meta?.target) ? error.meta.target.filter((value): value is string => typeof value === "string") : undefined;
-      throw conflict("SYNC_UNIQUE_CONFLICT", "The offline snapshot conflicts with an existing record.", target?.length ? { target } : undefined);
+      const target = error instanceof Prisma.PrismaClientKnownRequestError ? error.meta?.target : undefined;
+      const fields = Array.isArray(target) ? target.filter((value): value is string => typeof value === "string") : typeof target === "string" ? [target] : undefined;
+      const entity = error instanceof Prisma.PrismaClientKnownRequestError && typeof error.meta?.modelName === "string" ? error.meta.modelName : undefined;
+      logger.warn({ requestId: response.locals.requestId, operationId: body.operationId, deviceId: body.deviceId, entity, fields }, "offline sync unique constraint");
+      throw conflict("SYNC_UNIQUE_CONFLICT", "The offline snapshot conflicts with an existing record.", entity || fields?.length ? { ...(entity ? { entity } : {}), ...(fields?.length ? { fields } : {}) } : undefined);
     }
     throw error;
   }
