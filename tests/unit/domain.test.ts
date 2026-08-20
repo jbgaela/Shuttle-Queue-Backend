@@ -149,6 +149,15 @@ test("balanced mode keeps player and team strength gaps within one", () => {
   assert.equal(boundary.difference, 1);
 });
 
+test("balanced +2/+3 variants and rest boundary are enforced", () => {
+  assert.equal(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 3), player("d", Gender.MALE, 3)], MatchmakingMode.BALANCED, history), null);
+  assert.ok(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 3), player("d", Gender.MALE, 3)], MatchmakingMode.BALANCED, history, [], { strengthGap: 2 }));
+  const rested = ["a", "b", "c", "d"].map((id) => player(id, Gender.MALE, 2));
+  rested[0]!.lastMatchEndedAt = new Date("2026-01-01T09:30:00Z");
+  assert.equal(suggestMatch(rested, MatchmakingMode.OPEN, history, [], { minimumRestMinutes: 30, now: new Date("2026-01-01T09:29:59Z") }), null);
+  assert.ok(suggestMatch(rested, MatchmakingMode.OPEN, history, [], { minimumRestMinutes: 30, now: new Date("2026-01-01T10:00:00Z") }));
+});
+
 test("balanced suggestions prioritize players skipped by the previous lineup", () => {
   const players = ["a", "b", "c", "d", "e", "f"].map((id) => player(id, Gender.MALE, 2));
   const first = suggestMatch(players, MatchmakingMode.BALANCED, history);

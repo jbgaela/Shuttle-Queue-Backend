@@ -163,7 +163,7 @@ model QueueWorkspace {
   startedAt              DateTime    @default(now())
   endedAt                DateTime?
   lateArrivalCutoffAt    DateTime?
-  matchmakingAlgorithm   String      @default("v2-rotation")
+  matchmakingAlgorithm   String      @default("v3-rest-strength")
   matchmakingRevision    Int         @default(1)
   createdAt              DateTime    @default(now())
   updatedAt              DateTime    @updatedAt
