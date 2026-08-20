@@ -1,16 +1,17 @@
-import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
+import { mergeSyncSnapshots, type CloudSnapshotV2, type SyncMetadata } from "@shuttle-queue/domain";
 import { conflict } from "./errors.js";
 import { normalizeName } from "./normalize.js";
 
 type SyncDatabase = any;
 
 export type SyncUpload = {
-  schemaVersion: 2;
+  schemaVersion: 2 | 3;
   deviceId: string;
   operationId: string;
   baseCloudRevision: number;
   force: boolean;
   snapshot: CloudSnapshotV2;
+  metadata?: SyncMetadata;
   auditEvents: Array<Record<string, unknown>>;
 };
 
@@ -189,8 +190,28 @@ export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: str
   for (const event of auditEvents) await tx.auditLog.create({ data: { queueMasterId, action: typeof event.action === "string" ? event.action : "OFFLINE_EVENT", entityType: typeof event.entityType === "string" ? event.entityType : "ACCOUNT", entityId: typeof event.entityId === "string" ? event.entityId : queueMasterId, reason: typeof event.reason === "string" ? event.reason : "Recorded offline", beforeJson: event.beforeJson, afterJson: event.afterJson, requestId: `offline:${operationId}` } });
 }
 
-export async function persistSyncSnapshot(tx: SyncDatabase, upload: SyncUpload, queueMasterId: string) {
+export async function persistSyncSnapshot(tx: SyncDatabase, upload: SyncUpload, queueMasterId: string, readCurrent?: (tx: SyncDatabase) => Promise<{ snapshot: CloudSnapshotV2; metadata?: SyncMetadata }>) {
   const state = await tx.accountSyncState.upsert({ where: { queueMasterId }, create: { queueMasterId, schemaVersion: 2 }, update: {} });
+  if (upload.schemaVersion === 3) {
+    const receipts = tx.syncOperationReceipt;
+    const priorReceipt = receipts?.findUnique ? await receipts.findUnique({ where: { queueMasterId_operationId: { queueMasterId, operationId: upload.operationId } } }) : null;
+    if (priorReceipt) {
+      const current = readCurrent ? await readCurrent(tx) : undefined;
+      return { state, alreadyApplied: true, snapshot: current?.snapshot, metadata: current?.metadata ?? state.mergeMetadata as SyncMetadata | undefined };
+    }
+    validateSyncSnapshot(upload.snapshot);
+    const current = readCurrent ? await readCurrent(tx) : { snapshot: upload.snapshot, metadata: state.mergeMetadata as SyncMetadata | undefined };
+    const merged = mergeSyncSnapshots(upload.snapshot, current.snapshot, upload.metadata, current.metadata ?? state.mergeMetadata as SyncMetadata | undefined);
+    validateSyncSnapshot(merged.snapshot);
+    await assertStableNaturalKeys(tx, queueMasterId, merged.snapshot);
+    const claimed = await tx.accountSyncState.updateMany({ where: { id: state.id, version: state.version }, data: { cloudRevision: { increment: 1 }, schemaVersion: 3, mergeMetadata: merged.metadata as any, lastDeviceId: upload.deviceId, lastOperationId: upload.operationId, lastSyncedAt: new Date(), version: { increment: 1 } } });
+    if (claimed.count !== 1) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the offline changes were being merged.", { cloudRevision: state.cloudRevision });
+    await reconcileSyncSnapshot(tx, queueMasterId, merged.snapshot, upload.auditEvents, upload.operationId);
+    const updated = await tx.accountSyncState.findUnique({ where: { id: state.id } });
+    if (!updated) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the snapshot was being saved.");
+    if (receipts?.create) await receipts.create({ data: { queueMasterId, operationId: upload.operationId, deviceId: upload.deviceId, cloudRevision: updated.cloudRevision } });
+    return { state: updated, alreadyApplied: false, snapshot: merged.snapshot, metadata: merged.metadata };
+  }
   if (state.lastDeviceId === upload.deviceId && state.lastOperationId === upload.operationId) return { state, alreadyApplied: true };
   if (!upload.force && state.cloudRevision !== upload.baseCloudRevision) throw conflict("SYNC_CLOUD_CHANGED", "Cloud data changed on another device.", { cloudRevision: state.cloudRevision });
   validateSyncSnapshot(upload.snapshot);

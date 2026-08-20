@@ -10,7 +10,8 @@ async function runTransaction<T>(callback: (transaction: Prisma.TransactionClien
     try {
       return await baseTransaction(callback, { ...transactionOptions, ...options });
     } catch (error) {
-      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2034" || attempt >= 2) throw error;
+      const retryable = error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034" || (error as any)?.code === "SYNC_CLOUD_CHANGED";
+      if (!retryable || attempt >= 2) throw error;
       await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
     }
   }

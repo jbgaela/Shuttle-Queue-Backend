@@ -124,6 +124,44 @@ api.use("/sync/snapshot", (request, _response, next) => {
   next();
 });
 
+// v3 merges a device snapshot with the current cloud state. The legacy route below
+// remains available for accounts that have not yet upgraded their first device.
+api.put("/sync/snapshot", requireAuth, requireMutationOrigin, (request, response, next) => {
+  if (request.body?.schemaVersion !== 3) { next(); return; }
+  route(async (request, response) => {
+  const body = parse(z.object({ schemaVersion: z.literal(3), deviceId: z.string().min(1).max(200), operationId: z.string().min(1).max(200), baseCloudRevision: z.number().int().min(0), force: z.boolean().default(false), snapshot: z.record(z.string(), z.unknown()), metadata: z.record(z.string(), z.unknown()).optional(), auditEvents: z.array(z.record(z.string(), z.unknown())).max(2000).default([]) }), request.body);
+  const snapshot = body.snapshot as unknown as CloudSnapshotV2;
+  if (snapshot.queueMasterId !== authUser(request).id || (snapshot.schemaVersion !== 2 && snapshot.schemaVersion !== 3)) throw badRequest("The snapshot is not valid for this account.");
+  const queueMasterId = authUser(request).id;
+  const result = await withTransactionRetry((tx) => persistSyncSnapshot(tx, { ...body, snapshot, schemaVersion: 3 } as SyncUpload, queueMasterId, async () => {
+    const currentState = await tx.accountSyncState.findUnique({ where: { queueMasterId } });
+    return { snapshot: await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId)), metadata: currentState?.mergeMetadata as any };
+  }), { maxWait: 10_000, timeout: 30_000 });
+  responseData(response, { cloudRevision: result.state.cloudRevision, lastSyncedAt: result.state.lastSyncedAt, schemaVersion: 3, alreadyApplied: result.alreadyApplied, snapshot: result.snapshot, metadata: result.metadata });
+  })(request, response, next);
+});
+api.get("/sync/snapshot", requireAuth, route(async (request, response) => {
+  const queueMasterId = authUser(request).id;
+  const snapshot = await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId));
+  const state = await db.accountSyncState.upsert({ where: { queueMasterId }, create: { queueMasterId, schemaVersion: 2 }, update: {} });
+  const upgraded = state.schemaVersion >= 3;
+  const responseSnapshot = upgraded ? { ...snapshot, schemaVersion: 3 as const } : snapshot;
+  responseData(response, { snapshot: responseSnapshot, checksum: snapshotChecksum(responseSnapshot), cloudRevision: state.cloudRevision, schemaVersion: upgraded ? 3 : 2, ...(upgraded ? { metadata: state.mergeMetadata } : {}) });
+}));
+api.get("/sync/status", requireAuth, route(async (request, response) => {
+  const queueMasterId = authUser(request).id;
+  const state = await db.accountSyncState.upsert({ where: { queueMasterId }, create: { queueMasterId, schemaVersion: 2 }, update: {} });
+  responseData(response, { cloudRevision: state.cloudRevision, lastSyncedAt: state.lastSyncedAt, lastDeviceId: state.lastDeviceId, schemaVersion: state.schemaVersion >= 3 ? 3 : 2 });
+}));
+api.put("/sync/snapshot", (request, _response, next) => {
+  if (request.body?.schemaVersion !== 2) { next(); return; }
+  const queueMasterId = authUser(request).id;
+  db.accountSyncState.findUnique({ where: { queueMasterId }, select: { schemaVersion: true } }).then((state: any) => {
+    if ((state?.schemaVersion ?? 2) >= 3) { next(conflict("SYNC_CLIENT_UPGRADE_REQUIRED", "This account now uses conflict-free sync. Refresh the application before syncing.")); return; }
+    next();
+  }).catch(next);
+});
+
 api.use((request, _response, next) => {
   if (request.method === "GET" || !(request as AuthenticatedRequest).auth) { next(); return; }
   const allowedAfterEnd = ["/workspace/end", "/workspace/start-fresh", "/payments", "/players", "/auth/", "/admin/", "/sync/"];

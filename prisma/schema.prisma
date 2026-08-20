@@ -128,6 +128,7 @@ model QueueMaster {
   auditLogs             AuditLog[]
   idempotencyRecords    IdempotencyRecord[]
   syncState             AccountSyncState?
+  syncOperations        SyncOperationReceipt[]
 }
 
 // A single database row serializes account mutations that must preserve
@@ -179,9 +180,23 @@ model AccountSyncState {
   lastOperationId   String?
   lastSyncedAt      DateTime?
   schemaVersion     Int         @default(2)
+  mergeMetadata     Json?
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
   version           Int         @default(1)
+}
+
+model SyncOperationReceipt {
+  id             String      @id @default(uuid()) @map("_id")
+  queueMasterId  String
+  queueMaster    QueueMaster @relation(fields: [queueMasterId], references: [id])
+  operationId    String
+  deviceId       String
+  cloudRevision  Int
+  createdAt      DateTime    @default(now())
+
+  @@unique([queueMasterId, operationId])
+  @@index([queueMasterId, createdAt])
 }
 
 model AuthSession {
