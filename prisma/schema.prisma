@@ -148,6 +148,7 @@ model QueueMasterSettings {
   scoreCap              Int?
   bestOf                Int                @default(1)
   minimumRestMinutes    Int                @default(0)
+  lateArrivalGraceMinutes Int              @default(10)
   defaultFeeMode        FeeMode            @default(FIXED_PER_PLAYER)
   defaultFixedFeeMinor  Int?
   currencyCode          String             @default("PHP")

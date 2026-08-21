@@ -3,6 +3,7 @@ import { conflict } from "./errors.js";
 import { normalizeName } from "./normalize.js";
 
 type SyncDatabase = any;
+const DEFAULT_LATE_ARRIVAL_GRACE_MINUTES = 10;
 
 export type SyncUpload = {
   schemaVersion: 2 | 3;
@@ -183,7 +184,7 @@ export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: str
   await tx.court.deleteMany({ where: { queueMasterId, ...(courtIds.length ? { id: { notIn: courtIds } } : {}) } });
   await tx.player.deleteMany({ where: { queueMasterId, ...(playerIds.length ? { id: { notIn: playerIds } } : {}) } });
 
-  if (snapshot.settings) await tx.queueMasterSettings.update({ where: { queueMasterId }, data: { pointsToWin: snapshot.settings.pointsToWin, winBy: snapshot.settings.winBy, scoreCap: snapshot.settings.scoreCap, bestOf: snapshot.settings.bestOf, minimumRestMinutes: snapshot.settings.minimumRestMinutes, defaultFeeMode: snapshot.settings.defaultFeeMode, defaultFixedFeeMinor: snapshot.settings.defaultFixedFeeMinor, currencyCode: snapshot.settings.currencyCode, timeZone: snapshot.settings.timeZone, defaultLateArrivalCutoffTime: snapshot.settings.defaultLateArrivalCutoffTime } });
+  if (snapshot.settings) await tx.queueMasterSettings.update({ where: { queueMasterId }, data: { pointsToWin: snapshot.settings.pointsToWin, winBy: snapshot.settings.winBy, scoreCap: snapshot.settings.scoreCap, bestOf: snapshot.settings.bestOf, minimumRestMinutes: snapshot.settings.minimumRestMinutes, lateArrivalGraceMinutes: snapshot.settings.lateArrivalGraceMinutes ?? DEFAULT_LATE_ARRIVAL_GRACE_MINUTES, defaultFeeMode: snapshot.settings.defaultFeeMode, defaultFixedFeeMinor: snapshot.settings.defaultFixedFeeMinor, currencyCode: snapshot.settings.currencyCode, timeZone: snapshot.settings.timeZone, defaultLateArrivalCutoffTime: snapshot.settings.defaultLateArrivalCutoffTime } });
   await tx.queueWorkspace.update({ where: { queueMasterId }, data: { startedAt: new Date(snapshot.workspace.startedAt), endedAt: snapshot.workspace.endedAt ? new Date(snapshot.workspace.endedAt) : null, lateArrivalCutoffAt: snapshot.workspace.lateArrivalCutoffAt ? new Date(snapshot.workspace.lateArrivalCutoffAt) : null, matchmakingAlgorithm: snapshot.workspace.matchmakingAlgorithm, matchmakingRevision: snapshot.workspace.matchmakingRevision, version: snapshot.workspace.version } });
   if (snapshot.feeConfig) await tx.queueFeeConfig.upsert({ where: { queueMasterId }, create: { queueMasterId, mode: snapshot.feeConfig.mode, currencyCode: snapshot.feeConfig.currencyCode, fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor, expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor, participationRule: snapshot.feeConfig.participationRule, frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null, version: snapshot.feeConfig.version }, update: { mode: snapshot.feeConfig.mode, currencyCode: snapshot.feeConfig.currencyCode, fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor, expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor, participationRule: snapshot.feeConfig.participationRule, frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null, version: snapshot.feeConfig.version } });
   else await tx.queueFeeConfig.deleteMany({ where: { queueMasterId } });

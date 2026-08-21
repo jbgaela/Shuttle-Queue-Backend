@@ -6,7 +6,7 @@ import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actio
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
 import { suggestMatch, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
-import { datePartsForInstant, instantForLocalDateTime } from "../../src/lib/timezone.js";
+import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
 
 const history = { partners: new Map(), opponents: new Map(), quartets: new Map() };
 const player = (id: string, gender: Gender, skillWeight: number, queueEnteredAt = new Date("2026-01-01T00:00:00Z")): MatchPlayer => ({ id, displayName: id, gender, skillWeight, skillLevel: "BEGINNER", status: QueuePlayerStatus.WAITING, gamesPlayed: 0, queueEnteredAt, lastMatchEndedAt: null, manualPriority: 0 });
@@ -39,11 +39,14 @@ test("equal split allocates the remainder deterministically", () => {
 
 test("bulk queue actions preserve first check-in and apply one batch timestamp", () => {
   const changedAt = new Date("2026-02-01T10:00:00Z");
-  const firstCheckIn = new Date("2026-01-01T10:00:00Z");
+  const inclusiveCutoff = new Date("2026-02-01T10:00:59.999Z");
   assert.deepEqual(allowedQueueStatuses("CHECK_IN"), ["INACTIVE", "CHECKED_OUT"]);
-  assert.deepEqual(queueActionData({ checkedInAt: firstCheckIn, latePenaltyState: null }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: firstCheckIn, checkedOutAt: null, queueEnteredAt: changedAt, latePenaltyState: "PENDING", latePenaltyAppliedAt: changedAt });
+  assert.deepEqual(queueActionData({ checkedInAt: null, latePenaltyState: null }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: changedAt, checkedOutAt: null, queueEnteredAt: changedAt, latePenaltyState: "PENDING", latePenaltyAppliedAt: changedAt });
+  assert.deepEqual(queueActionData({ checkedInAt: new Date("2026-01-01T08:00:00Z"), latePenaltyState: null }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: new Date("2026-01-01T08:00:00Z"), checkedOutAt: null, queueEnteredAt: changedAt });
   assert.deepEqual(queueActionData({ checkedInAt: null, latePenaltyState: null }, "CHECK_IN", changedAt, changedAt), { status: "WAITING", checkedInAt: changedAt, checkedOutAt: null, queueEnteredAt: changedAt });
   assert.deepEqual(queueActionData({ checkedInAt: null, latePenaltyState: "WAIVED" }, "CHECK_IN", changedAt, new Date("2026-01-01T09:00:00Z")), { status: "WAITING", checkedInAt: changedAt, checkedOutAt: null, queueEnteredAt: changedAt });
+  assert.equal(queueActionData({ checkedInAt: null, latePenaltyState: null }, "CHECK_IN", inclusiveCutoff, inclusiveCutoff).latePenaltyState, undefined);
+  assert.equal(queueActionData({ checkedInAt: null, latePenaltyState: null }, "CHECK_IN", new Date(inclusiveCutoff.getTime() + 1), inclusiveCutoff).latePenaltyState, "PENDING");
   assert.deepEqual(queueActionData({}, "REST", changedAt), { status: "RESTING", restStartedAt: changedAt });
   assert.deepEqual(queueActionData({}, "CHECK_OUT", changedAt), { status: "CHECKED_OUT", checkedOutAt: changedAt, queueEnteredAt: null });
 });
@@ -52,6 +55,7 @@ test("late-arrival wall clocks use the account timezone across UTC date boundari
   assert.equal(datePartsForInstant(new Date("2026-08-14T17:00:00.000Z"), "Asia/Manila"), "2026-08-15");
   assert.equal(instantForLocalDateTime("2026-08-15T22:00", "Asia/Manila").toISOString(), "2026-08-15T14:00:00.000Z");
   assert.equal(instantForLocalDateTime("2026-08-15T00:00", "Asia/Manila").toISOString(), "2026-08-14T16:00:00.000Z");
+  assert.equal(inclusiveMinuteCutoff("2026-08-15T22:00", "Asia/Manila").toISOString(), "2026-08-15T14:00:59.999Z");
 });
 
 test("collection totals group valid methods and ignore non-collections", () => {
@@ -84,6 +88,15 @@ test("late penalties are minimized before existing fairness rules", () => {
   const required = suggestMatch(players.filter((item) => item.id !== "d"), MatchmakingMode.OPEN, history);
   assert.ok(required);
   assert.equal([...required.teamA, ...required.teamB].some((item) => item.id === "e"), true);
+});
+
+test("games-played fairness outranks pending late preference", () => {
+  const players = ["a", "b", "c", "d"].map((id) => ({ ...player(id, Gender.MALE, 2), gamesPlayed: 1 }));
+  players.push({ ...player("e", Gender.MALE, 2), gamesPlayed: 0, latePenaltyState: "PENDING" });
+  const result = suggestMatch(players, MatchmakingMode.OPEN, history);
+  assert.ok(result);
+  assert.equal([...result.teamA, ...result.teamB].some((item) => item.id === "e"), true);
+  assert.equal((result.explanation.fairness as { minimumGames: number }).minimumGames, 0);
 });
 
 test("rotation avoids an exact quartet that has already played together", () => {

@@ -39,3 +39,7 @@ export function localDateTimeForInstant(value: Date, timeZone: string) {
   const parts = formatParts(value, timeZone);
   return `${datePartsForInstant(value, timeZone)}T${parts.hour.toString().padStart(2, "0")}:${parts.minute.toString().padStart(2, "0")}`;
 }
+
+export function inclusiveMinuteCutoff(value: string, timeZone: string) {
+  return new Date(instantForLocalDateTime(value, timeZone).getTime() + 59_999);
+}

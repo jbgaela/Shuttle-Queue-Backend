@@ -16,6 +16,9 @@ export function normalizeQueuePlayerSnapshotFields(snapshot: unknown): unknown {
   if (!Array.isArray(value.queuePlayers)) return snapshot;
   return {
     ...value,
+    settings: value.settings && typeof value.settings === "object" && !Array.isArray(value.settings)
+      ? { ...(value.settings as Record<string, unknown>), lateArrivalGraceMinutes: (value.settings as Record<string, unknown>).lateArrivalGraceMinutes ?? 10 }
+      : value.settings,
     queuePlayers: value.queuePlayers.map((player) => {
       if (!player || typeof player !== "object" || Array.isArray(player)) return player;
       const queuePlayer = player as Record<string, unknown>;

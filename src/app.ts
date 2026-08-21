@@ -21,12 +21,13 @@ import { validateScores, type ScoreInput } from "./lib/score.js";
 import { normalizeQueuePlayerSnapshotFields } from "./lib/sync-snapshot.js";
 import { persistSyncSnapshot, type SyncUpload } from "./lib/sync-persistence.js";
 import { clearLoginFailures, clearSessionCookie, currentCsrfToken, issueSession, passwordHash, recordLoginFailure, requireAuth, requireMutationOrigin, requireSuperAdmin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
-import { datePartsForInstant, instantForLocalDateTime } from "./lib/timezone.js";
+import { datePartsForInstant, inclusiveMinuteCutoff } from "./lib/timezone.js";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 
 const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "password", "passwordHash"] });
 const pinoHttp = pinoHttpModule as unknown as (options: unknown) => RequestHandler;
 const MATCHMAKING_ALGORITHM = "v3-rest-strength";
+const DEFAULT_LATE_ARRIVAL_GRACE_MINUTES = 10;
 const db: any = prisma;
 const api = express.Router();
 const idSchema = z.string().uuid();
@@ -41,7 +42,7 @@ const PLAYER_NAME_CONFLICT_MESSAGE = "A player with this name has already been c
 const cloudSnapshotSchema = z.strictObject({
   schemaVersion: z.literal(2),
   queueMasterId: z.string().min(1),
-  settings: z.strictObject({ id: z.string(), pointsToWin: z.number().int(), winBy: z.number().int(), scoreCap: z.number().int().nullable(), bestOf: z.union([z.literal(1), z.literal(3)]), minimumRestMinutes: z.number().int(), defaultFeeMode: z.nativeEnum(FeeMode), defaultFixedFeeMinor: z.number().int().nullable(), currencyCode: z.string(), timeZone: z.string(), defaultLateArrivalCutoffTime: z.string().nullable(), version: z.number().int() }).nullable(),
+  settings: z.strictObject({ id: z.string(), pointsToWin: z.number().int(), winBy: z.number().int(), scoreCap: z.number().int().nullable(), bestOf: z.union([z.literal(1), z.literal(3)]), minimumRestMinutes: z.number().int(), lateArrivalGraceMinutes: z.number().int().min(1).max(60).default(DEFAULT_LATE_ARRIVAL_GRACE_MINUTES), defaultFeeMode: z.nativeEnum(FeeMode), defaultFixedFeeMinor: z.number().int().nullable(), currencyCode: z.string(), timeZone: z.string(), defaultLateArrivalCutoffTime: z.string().nullable(), version: z.number().int() }).nullable(),
   workspace: z.strictObject({ startedAt: z.string().datetime(), endedAt: z.string().datetime().nullable().optional(), lateArrivalCutoffAt: z.string().datetime().nullable(), matchmakingAlgorithm: z.string(), matchmakingRevision: z.number().int(), version: z.number().int() }),
   players: z.array(z.strictObject({ id: z.string(), displayName: z.string(), gender: z.nativeEnum(Gender), skillLevel: z.nativeEnum(SkillLevel), skillWeight: z.number(), status: z.nativeEnum(PlayerStatus) })),
   queuePlayers: z.array(z.strictObject({ id: z.string(), playerId: z.string(), displayName: z.string(), gender: z.nativeEnum(Gender), skillLevel: z.nativeEnum(SkillLevel), skillWeight: z.number(), status: z.nativeEnum(QueuePlayerStatus), queueEnteredAt: z.string().datetime().nullable(), lastMatchEndedAt: z.string().datetime().nullable(), matchesPlayed: z.number().int(), wins: z.number().int(), losses: z.number().int(), pointsFor: z.number().int(), pointsAgainst: z.number().int(), amountDueMinor: z.number().int(), manualPriority: z.number().int(), priorityReason: z.string().nullable(), latePenaltyState: z.nativeEnum(LatePenaltyState).nullable(), latePenaltyAppliedAt: z.string().datetime().nullable(), currentMatchId: z.string().nullable(), checkedInAt: z.string().datetime().nullable(), checkedOutAt: z.string().datetime().nullable(), restStartedAt: z.string().datetime().nullable(), version: z.number().int() })),
@@ -179,7 +180,7 @@ async function ensureWorkspace(queueMasterId: string, database = db) {
 function accountView(account: any) {
   return { id: account.id, username: account.username, role: account.role, status: account.status, createdAt: account.createdAt, updatedAt: account.updatedAt, lastLoginAt: account.lastLoginAt, passwordChangedAt: account.passwordChangedAt, version: account.version, playerCount: account._count?.players ?? 0, queuePlayerCount: account._count?.queuePlayers ?? 0, courtCount: account._count?.courts ?? 0, matchCount: account._count?.matches ?? 0 };
 }
-function settingsView(settings: any) { return settings ? { id: settings.id, pointsToWin: settings.pointsToWin, winBy: settings.winBy, scoreCap: settings.scoreCap, bestOf: settings.bestOf, minimumRestMinutes: settings.minimumRestMinutes, defaultFeeMode: settings.defaultFeeMode, defaultFixedFeeMinor: settings.defaultFixedFeeMinor, currencyCode: settings.currencyCode, timeZone: settings.timeZone, defaultLateArrivalCutoffTime: settings.defaultLateArrivalCutoffTime, version: settings.version } : null; }
+function settingsView(settings: any) { return settings ? { id: settings.id, pointsToWin: settings.pointsToWin, winBy: settings.winBy, scoreCap: settings.scoreCap, bestOf: settings.bestOf, minimumRestMinutes: settings.minimumRestMinutes, lateArrivalGraceMinutes: settings.lateArrivalGraceMinutes ?? DEFAULT_LATE_ARRIVAL_GRACE_MINUTES, defaultFeeMode: settings.defaultFeeMode, defaultFixedFeeMinor: settings.defaultFixedFeeMinor, currencyCode: settings.currencyCode, timeZone: settings.timeZone, defaultLateArrivalCutoffTime: settings.defaultLateArrivalCutoffTime, version: settings.version } : null; }
 function playerView(player: any) { return { id: player.id, displayName: player.displayName, gender: player.gender, skillLevel: player.skillLevel, skillWeight: player.skillWeight, status: player.status, version: player.version }; }
 function restEligibleAt(lastMatchEndedAt: Date | null | undefined, minimumRestMinutes: number, now = Date.now()) { return !lastMatchEndedAt || minimumRestMinutes <= 0 ? new Date(now) : new Date(lastMatchEndedAt.getTime() + minimumRestMinutes * 60_000); }
 function assertPlayersRestEligible(players: any[], minimumRestMinutes: number, now = Date.now()) { const blocked = players.map((player) => ({ player, eligibleAt: restEligibleAt(player.lastMatchEndedAt, minimumRestMinutes, now) })).filter((entry) => entry.eligibleAt.getTime() > now); if (blocked.length) throw conflict("REST_REQUIRED", `${blocked.map(({ player }) => player.displayNameSnapshot).join(", ")} must complete the configured rest period before playing again.`, { blockedPlayers: blocked.map(({ player, eligibleAt }) => ({ queuePlayerId: player.id, displayName: player.displayNameSnapshot, eligibleAt })), nextEligibleAt: new Date(Math.min(...blocked.map(({ eligibleAt }) => eligibleAt.getTime()))) }); }
@@ -254,6 +255,12 @@ async function reconcileQueuePlayers(tx: any, queueMasterId: string, queuePlayer
   }
 }
 
+async function serveLatePenalties(tx: any, queueMasterId: string, queuePlayerIds: string[]) {
+  const ids = [...new Set(queuePlayerIds)];
+  if (!ids.length) return;
+  await tx.queuePlayer.updateMany({ where: { queueMasterId, id: { in: ids }, latePenaltyState: LatePenaltyState.PENDING }, data: { latePenaltyState: LatePenaltyState.SERVED, version: { increment: 1 } } });
+}
+
 function snapshotQueueSummary(snapshot: CloudSnapshotV2, queuePlayerId: string) {
   const active = snapshot.matches.filter((match) => match.status === "IN_PROGRESS" && match.participants.some((participant) => participant.queuePlayerId === queuePlayerId));
   if (active.length > 1) throw badRequest("A player cannot be in more than one active match.");
@@ -304,7 +311,7 @@ api.post("/auth/logout", requireAuth, requireMutationOrigin, route(async (reques
 api.post("/auth/change-password", requireAuth, requireMutationOrigin, route(async (request, response) => { const body = parse(z.object({ currentPassword: z.string(), newPassword: accountPasswordSchema }), request.body); const user = authUser(request); if (!(await verifyPassword(user.passwordHash, body.currentPassword).catch(() => false))) throw unauthorized("The current password is incorrect."); const updated = await db.queueMaster.update({ where: { id: user.id }, data: { passwordHash: await passwordHash(body.newPassword), passwordChangedAt: new Date(), version: { increment: 1 } } }); responseData(response, { user: { id: updated.id, username: updated.username, role: updated.role } }); }));
 
 api.get("/settings", requireAuth, route(async (request, response) => { const { settings } = await ensureWorkspace(authUser(request).id); responseData(response, settingsView(settings)); }));
-api.patch("/settings", requireAuth, requireMutationOrigin, route(async (request, response) => { const current = (await ensureWorkspace(authUser(request).id)).settings; assertVersion(current.version, versionFrom(request)); const body = parse(z.object({ pointsToWin: z.number().int().min(1).max(99).optional(), winBy: z.number().int().min(1).max(10).optional(), scoreCap: z.number().int().min(1).max(99).nullable().optional(), bestOf: z.union([z.literal(1), z.literal(3)]).optional(), minimumRestMinutes: z.number().int().min(0).max(60).optional(), defaultFeeMode: z.enum([FeeMode.FIXED_PER_PLAYER, FeeMode.EQUAL_SPLIT]).optional(), defaultFixedFeeMinor: z.number().int().min(0).max(2_000_000_000).nullable().optional(), defaultLateArrivalCutoffTime: clockTimeSchema.nullable().optional() }), request.body); const points = body.pointsToWin ?? current.pointsToWin; const scoreCap = body.scoreCap === undefined ? current.scoreCap : body.scoreCap; if (scoreCap !== null && scoreCap < points) throw badRequest("The score cap cannot be lower than points to win."); const updated = await db.queueMasterSettings.update({ where: { id: current.id }, data: { ...body, pointsToWin: points, scoreCap, version: { increment: 1 } } }); responseData(response, settingsView(updated)); }));
+api.patch("/settings", requireAuth, requireMutationOrigin, route(async (request, response) => { const current = (await ensureWorkspace(authUser(request).id)).settings; assertVersion(current.version, versionFrom(request)); const body = parse(z.object({ pointsToWin: z.number().int().min(1).max(99).optional(), winBy: z.number().int().min(1).max(10).optional(), scoreCap: z.number().int().min(1).max(99).nullable().optional(), bestOf: z.union([z.literal(1), z.literal(3)]).optional(), minimumRestMinutes: z.number().int().min(0).max(60).optional(), lateArrivalGraceMinutes: z.number().int().min(1).max(60).optional(), defaultFeeMode: z.enum([FeeMode.FIXED_PER_PLAYER, FeeMode.EQUAL_SPLIT]).optional(), defaultFixedFeeMinor: z.number().int().min(0).max(2_000_000_000).nullable().optional(), defaultLateArrivalCutoffTime: clockTimeSchema.nullable().optional() }), request.body); const points = body.pointsToWin ?? current.pointsToWin; const scoreCap = body.scoreCap === undefined ? current.scoreCap : body.scoreCap; if (scoreCap !== null && scoreCap < points) throw badRequest("The score cap cannot be lower than points to win."); const updated = await db.queueMasterSettings.update({ where: { id: current.id }, data: { ...body, pointsToWin: points, scoreCap, version: { increment: 1 } } }); responseData(response, settingsView(updated)); }));
 
 api.get("/workspace", requireAuth, route(async (request, response) => { const { settings, workspace } = await ensureWorkspace(authUser(request).id); const counts = await db.queueMaster.findUnique({ where: { id: authUser(request).id }, select: { _count: { select: { queuePlayers: true, courts: true } } } }); const fee = await db.queueFeeConfig.findUnique({ where: { queueMasterId: authUser(request).id } }); responseData(response, workspaceView(workspace, settings, counts?._count, fee)); }));
 api.post("/workspace/start-fresh", requireAuth, requireMutationOrigin, route(async (request, response) => { const queueMasterId = authUser(request).id; const current = await db.queueWorkspace.findUnique({ where: { queueMasterId } }); if (!current) { await ensureWorkspace(queueMasterId); } const expected = versionFrom(request); assertVersion(current?.version ?? 1, expected); const settings = await db.queueMasterSettings.findUnique({ where: { queueMasterId } }); const result = await withTransactionRetry(async (tx) => { await tx.matchGame.deleteMany({ where: { scoreRevision: { match: { queueMasterId } } } }); await tx.matchScoreRevision.deleteMany({ where: { match: { queueMasterId } } }); await tx.matchParticipant.deleteMany({ where: { match: { queueMasterId } } }); await tx.match.deleteMany({ where: { queueMasterId } }); await tx.payment.deleteMany({ where: { queueMasterId } }); await tx.queuePlayer.deleteMany({ where: { queueMasterId } }); await tx.court.deleteMany({ where: { queueMasterId } }); await tx.auditLog.deleteMany({ where: { queueMasterId, entityType: { in: ["MATCH", "QUEUE_PLAYER", "COURT", "WORKSPACE", "PAYMENT", "FEE_CONFIG"] } } }); await tx.idempotencyRecord.deleteMany({ where: { queueMasterId, operation: "PAYMENT_CREATE" } }); const workspace = await tx.queueWorkspace.update({ where: { queueMasterId, version: expected }, data: { startedAt: new Date(), endedAt: null, lateArrivalCutoffAt: null, matchmakingRevision: { increment: 1 }, version: { increment: 1 } } }); await tx.queueFeeConfig.upsert({ where: { queueMasterId }, create: { queueMasterId, mode: settings?.defaultFeeMode ?? FeeMode.FIXED_PER_PLAYER, currencyCode: settings?.currencyCode ?? "PHP", fixedAmountPerPlayerMinor: settings?.defaultFixedFeeMinor ?? null, expectedQueueCostMinor: 0 }, update: { mode: settings?.defaultFeeMode ?? FeeMode.FIXED_PER_PLAYER, currencyCode: settings?.currencyCode ?? "PHP", fixedAmountPerPlayerMinor: settings?.defaultFixedFeeMinor ?? null, expectedQueueCostMinor: 0, frozenAt: null, version: { increment: 1 } } }); return workspace; }); responseData(response, workspaceView(result, settings, { queuePlayers: 0, courts: 0 }, await db.queueFeeConfig.findUnique({ where: { queueMasterId } }))); }));
@@ -312,24 +319,34 @@ api.patch("/workspace/late-arrival-policy", requireAuth, requireMutationOrigin, 
   const workspace = await workspaceFor(request);
   assertVersion(workspace.version, versionFrom(request));
   const settings = (await ensureWorkspace(authUser(request).id)).settings;
-  const body = parse(z.discriminatedUnion("mode", [z.object({ mode: z.literal("SET_NOW") }), z.object({ mode: z.literal("APPLY_ACCOUNT_DEFAULT") }), z.object({ mode: z.literal("SET_CUSTOM"), localDateTime: z.string().regex(/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d$/) }), z.object({ mode: z.literal("DISABLED") })]), request.body);
+  const body = parse(z.discriminatedUnion("mode", [z.object({ mode: z.literal("SET_NOW") }), z.object({ mode: z.literal("START_GRACE") }), z.object({ mode: z.literal("APPLY_ACCOUNT_DEFAULT") }), z.object({ mode: z.literal("SET_CUSTOM"), localDateTime: z.string().regex(/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d$/) }), z.object({ mode: z.literal("DISABLED") })]), request.body);
   let cutoff: Date | null = null;
   try {
     if (body.mode === "SET_NOW") cutoff = new Date();
-    else if (body.mode === "APPLY_ACCOUNT_DEFAULT" && settings.defaultLateArrivalCutoffTime) cutoff = instantForLocalDateTime(`${datePartsForInstant(new Date(), settings.timeZone)}T${settings.defaultLateArrivalCutoffTime}`, settings.timeZone);
-    else if (body.mode === "SET_CUSTOM") cutoff = instantForLocalDateTime(body.localDateTime, settings.timeZone);
+    else if (body.mode === "START_GRACE") cutoff = new Date(Date.now() + (settings.lateArrivalGraceMinutes ?? DEFAULT_LATE_ARRIVAL_GRACE_MINUTES) * 60_000);
+    else if (body.mode === "APPLY_ACCOUNT_DEFAULT" && settings.defaultLateArrivalCutoffTime) cutoff = inclusiveMinuteCutoff(`${datePartsForInstant(new Date(), settings.timeZone)}T${settings.defaultLateArrivalCutoffTime}`, settings.timeZone);
+    else if (body.mode === "SET_CUSTOM") cutoff = inclusiveMinuteCutoff(body.localDateTime, settings.timeZone);
   } catch {
     throw badRequest("The cutoff time is invalid for the account timezone.");
   }
   const queueMasterId = authUser(request).id;
+  let reclassifiedPlayerCount = 0;
   const updated = await withTransactionRetry(async (tx) => {
     const next = await tx.queueWorkspace.update({ where: { queueMasterId, version: workspace.version }, data: { lateArrivalCutoffAt: cutoff, matchmakingRevision: { increment: 1 }, version: { increment: 1 } } });
-    if (body.mode === "DISABLED") await tx.queuePlayer.updateMany({ where: { queueMasterId, latePenaltyState: LatePenaltyState.PENDING }, data: { latePenaltyState: null, latePenaltyAppliedAt: null, version: { increment: 1 } } });
-    else if (cutoff) await tx.queuePlayer.updateMany({ where: { queueMasterId, latePenaltyState: LatePenaltyState.PENDING, latePenaltyAppliedAt: { lte: cutoff } }, data: { latePenaltyState: null, latePenaltyAppliedAt: null, version: { increment: 1 } } });
+    const pendingWhere = body.mode === "DISABLED"
+      ? { queueMasterId, latePenaltyState: LatePenaltyState.PENDING }
+      : cutoff
+        ? { queueMasterId, latePenaltyState: LatePenaltyState.PENDING, OR: [{ checkedInAt: { lte: cutoff } }, { checkedInAt: null, latePenaltyAppliedAt: { lte: cutoff } }] }
+        : null;
+    if (pendingWhere) {
+      const repaired = await tx.queuePlayer.updateMany({ where: pendingWhere, data: { latePenaltyState: null, latePenaltyAppliedAt: null, version: { increment: 1 } } });
+      reclassifiedPlayerCount = repaired.count;
+    }
+    await audit(tx, request, { action: "LATE_ARRIVAL_POLICY_UPDATED", entityType: "WORKSPACE", entityId: queueMasterId, reason: `Arrival cutoff updated (${body.mode}); ${reclassifiedPlayerCount} pending player(s) reclassified as on time.`, before: { lateArrivalCutoffAt: workspace.lateArrivalCutoffAt?.toISOString() ?? null }, after: { lateArrivalCutoffAt: cutoff?.toISOString() ?? null, reclassifiedPlayerCount } });
     return next;
   });
   const account = await db.queueMaster.findUnique({ where: { id: queueMasterId }, select: { _count: { select: { queuePlayers: true, courts: true } } } });
-  responseData(response, workspaceView(updated, settings, account?._count, await db.queueFeeConfig.findUnique({ where: { queueMasterId } })));
+  responseData(response, { ...workspaceView(updated, settings, account?._count, await db.queueFeeConfig.findUnique({ where: { queueMasterId } })), reclassifiedPlayerCount });
 }));
 
 api.get("/players", requireAuth, route(async (request, response) => { const status = request.query.status === "ALL" ? undefined : PlayerStatus.ACTIVE; const rows = await db.player.findMany({ where: { queueMasterId: authUser(request).id, ...(status ? { status } : {}) }, orderBy: { normalizedName: "asc" } }); responseData(response, rows.map(playerView)); }));
@@ -403,7 +420,7 @@ api.post("/queue/players/bulk-action", requireAuth, requireMutationOrigin, route
   });
   responseData(response, updated.map(queuePlayerView));
 }));
-api.post("/queue/players/:id/check-in", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (![QueuePlayerStatus.INACTIVE, QueuePlayerStatus.CHECKED_OUT].includes(player.status)) throw conflict("INVALID_PLAYER_TRANSITION", "The player cannot be checked in from the current state."); const workspace = await workspaceFor(request); const checkedInAt = new Date(); const late = Boolean(workspace.lateArrivalCutoffAt && checkedInAt > workspace.lateArrivalCutoffAt && !player.latePenaltyState); const updated = await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.WAITING, checkedInAt: player.checkedInAt ?? checkedInAt, checkedOutAt: null, queueEnteredAt: checkedInAt, ...(late ? { latePenaltyState: LatePenaltyState.PENDING, latePenaltyAppliedAt: checkedInAt } : {}), version: { increment: 1 } } }); responseData(response, queuePlayerView(updated)); }));
+api.post("/queue/players/:id/check-in", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (![QueuePlayerStatus.INACTIVE, QueuePlayerStatus.CHECKED_OUT].includes(player.status)) throw conflict("INVALID_PLAYER_TRANSITION", "The player cannot be checked in from the current state."); const workspace = await workspaceFor(request); const checkedInAt = new Date(); const data = queueActionData(player, "CHECK_IN", checkedInAt, workspace?.lateArrivalCutoffAt) as any; const updated = await db.queuePlayer.update({ where: { id: player.id }, data: { ...data, version: { increment: 1 } } }); responseData(response, queuePlayerView(updated)); }));
 api.post("/queue/players/:id/rest", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (player.status !== QueuePlayerStatus.WAITING) throw conflict("INVALID_PLAYER_TRANSITION", "Only waiting players can rest."); responseData(response, queuePlayerView(await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.RESTING, restStartedAt: new Date(), version: { increment: 1 } } }))); }));
 api.post("/queue/players/:id/resume", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (player.status !== QueuePlayerStatus.RESTING) throw conflict("INVALID_PLAYER_TRANSITION", "Only resting players can resume."); responseData(response, queuePlayerView(await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.WAITING, restStartedAt: null, queueEnteredAt: new Date(), version: { increment: 1 } } }))); }));
 api.post("/queue/players/:id/check-out", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (![QueuePlayerStatus.INACTIVE, QueuePlayerStatus.WAITING, QueuePlayerStatus.RESTING].includes(player.status)) throw conflict("PLAYER_BUSY", "Busy players cannot be checked out."); responseData(response, queuePlayerView(await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.CHECKED_OUT, checkedOutAt: new Date(), queueEnteredAt: null, version: { increment: 1 } } }))); }));
@@ -443,6 +460,7 @@ async function createMatch(request: Request, body: { teamA: string[]; teamB: str
       if (claimedCourt.count !== 1) throw conflict("COURT_NOT_AVAILABLE", "The selected court is no longer available.");
     }
     await reconcileQueuePlayers(tx, queueMasterId, all, new Date(), new Map(all.map((id) => [id, { manualPriority: 0, priorityReason: null }])));
+    if (court) await serveLatePenalties(tx, queueMasterId, all);
     await tx.queueWorkspace.update({ where: { queueMasterId }, data: { matchmakingRevision: { increment: 1 }, version: { increment: 1 } } });
     return created.id;
   });
@@ -468,6 +486,7 @@ api.post("/matches/:id/start", requireAuth, requireMutationOrigin, route(async (
     if (claimedCourt.count !== 1) throw conflict("COURT_NOT_AVAILABLE", "The selected court is no longer available.");
     const claimedPlayers = await tx.queuePlayer.updateMany({ where: { id: { in: playerIds }, queueMasterId, status: { in: [QueuePlayerStatus.WAITING, QueuePlayerStatus.QUEUED] } }, data: { status: QueuePlayerStatus.PLAYING, currentMatchId: match.id, queueEnteredAt: null, version: { increment: 1 } } });
     if (claimedPlayers.count !== playerIds.length) throw conflict("PLAYER_LOCK_CONFLICT", "One or more players changed before the queued match could start.");
+    await serveLatePenalties(tx, queueMasterId, playerIds);
     const updated = await tx.match.updateMany({ where: { id: match.id, status: MatchStatus.QUEUED }, data: { courtId: court.id, courtIdSnapshot: court.id, courtNameSnapshot: court.name, status: MatchStatus.IN_PROGRESS, startedAt: new Date(), version: { increment: 1 } } });
     if (updated.count !== 1) throw conflict("MATCH_NOT_QUEUED", "The queued match changed before it could start.");
     return match.id;
