@@ -7,8 +7,11 @@ Copy-Item .env.example .env
 npm install
 npm run prisma:generate
 npm run prisma:validate
+npm run prisma:push
 npm run dev
 ```
+
+Render runs `prisma:push` as the pre-deploy step so additive schema changes, including public ranking publications, are applied before the new service starts.
 
 Use `npm run seed` once `BOOTSTRAP_USERNAME` and `BOOTSTRAP_PASSWORD` are set. `POST /api/v2/auth/login` establishes an opaque, httpOnly authentication session cookie; queue data is served from the account's automatically provisioned current workspace.
 

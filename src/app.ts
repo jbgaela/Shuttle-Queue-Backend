@@ -61,6 +61,8 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
       ? new AppError(422, "VALIDATION_ERROR", "The request is invalid.", error.flatten())
       : error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002"
         ? new AppError(409, "CONFLICT", "The requested value is already in use.")
+        : error instanceof Prisma.PrismaClientKnownRequestError && ["P2021", "P2022"].includes(error.code)
+          ? new AppError(503, "DATABASE_SCHEMA_NOT_READY", "The backend database schema is not up to date. Run Prisma db push before using this deployment.")
         : error;
   const status = err instanceof AppError ? err.status : 500;
   if (status >= 500) logger.error({ err: error, requestId: response.locals.requestId }, "request failed");

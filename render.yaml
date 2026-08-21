@@ -5,6 +5,7 @@ services:
     rootDir: .
     plan: starter
     buildCommand: npm ci --include=dev && npm run build
+    preDeployCommand: npm run prisma:push -- --skip-generate
     startCommand: npm run start
     healthCheckPath: /health/ready
     buildFilter:
