@@ -65,7 +65,17 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
           ? new AppError(503, "DATABASE_SCHEMA_NOT_READY", "The backend database schema is not up to date. Run Prisma db push before using this deployment.")
         : error;
   const status = err instanceof AppError ? err.status : 500;
-  if (status >= 500) logger.error({ err: error, requestId: response.locals.requestId }, "request failed");
+  if (status >= 500) {
+    const prismaError = error instanceof Prisma.PrismaClientKnownRequestError ? error : null;
+    logger.error({
+      requestId: response.locals.requestId,
+      errorName: error instanceof Error ? error.name : typeof error,
+      errorCode: prismaError?.code,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : undefined,
+      err: error,
+    }, "request failed");
+  }
   response.status(status).json({ error: { code: err instanceof AppError ? err.code : "INTERNAL_ERROR", message: status >= 500 ? "An unexpected server error occurred." : err.message, ...(err instanceof AppError && err.details !== undefined ? { details: err.details } : {}) }, requestId: response.locals.requestId });
 };
 
