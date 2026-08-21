@@ -129,6 +129,7 @@ model QueueMaster {
   idempotencyRecords    IdempotencyRecord[]
   syncState             AccountSyncState?
   syncOperations        SyncOperationReceipt[]
+  publicRankingPublications PublicRankingPublication[]
 }
 
 // A single database row serializes account mutations that must preserve
@@ -170,6 +171,26 @@ model QueueWorkspace {
   createdAt              DateTime    @default(now())
   updatedAt              DateTime    @updatedAt
   version                Int         @default(1)
+}
+
+model PublicRankingPublication {
+  id               String      @id @default(uuid()) @map("_id")
+  queueMasterId    String
+  queueMaster      QueueMaster @relation(fields: [queueMasterId], references: [id])
+  sessionStartedAt DateTime
+  sessionEndedAt   DateTime?
+  publicToken      String      @unique
+  enabled          Boolean     @default(true)
+  publishedAt      DateTime    @default(now())
+  finalizedAt      DateTime?
+  finalSnapshot    Json?
+  revokedAt        DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  version          Int         @default(1)
+
+  @@unique([queueMasterId, sessionStartedAt])
+  @@index([queueMasterId, enabled, revokedAt])
 }
 
 model AccountSyncState {

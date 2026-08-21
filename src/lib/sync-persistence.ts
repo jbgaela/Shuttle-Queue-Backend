@@ -5,6 +5,20 @@ import { normalizeName } from "./normalize.js";
 type SyncDatabase = any;
 const DEFAULT_LATE_ARRIVAL_GRACE_MINUTES = 10;
 
+export function publicRankingRowsFromSnapshot(snapshot: CloudSnapshotV2) {
+  return [...snapshot.queuePlayers]
+    .sort((left, right) => right.wins - left.wins || right.matchesPlayed - left.matchesPlayed || normalizeName(left.displayName).localeCompare(normalizeName(right.displayName)))
+    .map((player, index) => ({ rank: index + 1, player: player.displayName, matchesPlayed: player.matchesPlayed, wins: player.wins, losses: player.losses, winRateBasisPoints: player.matchesPlayed ? Math.floor((player.wins * 10_000) / player.matchesPlayed) : 0, pointsFor: player.pointsFor, pointsAgainst: player.pointsAgainst, pointDifferential: player.pointsFor - player.pointsAgainst }));
+}
+
+async function finalizePublicRankingFromSnapshot(tx: SyncDatabase, queueMasterId: string, sessionStartedAt: string, sessionEndedAt: Date, snapshot: CloudSnapshotV2) {
+  if (!tx.publicRankingPublication?.findFirst) return;
+  const publication = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: new Date(sessionStartedAt) } });
+  if (!publication || publication.finalizedAt) return;
+  await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { sessionEndedAt, finalizedAt: sessionEndedAt, finalSnapshot: { capturedAt: sessionEndedAt.toISOString(), rankings: publicRankingRowsFromSnapshot(snapshot) }, version: { increment: 1 } } });
+  await tx.auditLog.create({ data: { queueMasterId, action: "PUBLIC_RANKINGS_FINALIZED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Public rankings finalized during offline synchronization", beforeJson: { sessionStartedAt }, afterJson: { sessionEndedAt: sessionEndedAt.toISOString() }, requestId: `offline:sync:${sessionEndedAt.getTime()}` } });
+}
+
 export type SyncUpload = {
   schemaVersion: 2 | 3;
   deviceId: string;
@@ -207,6 +221,15 @@ export async function persistSyncSnapshot(tx: SyncDatabase, upload: SyncUpload, 
     await assertStableNaturalKeys(tx, queueMasterId, merged.snapshot);
     const claimed = await tx.accountSyncState.updateMany({ where: { id: state.id, version: state.version }, data: { cloudRevision: { increment: 1 }, schemaVersion: 3, mergeMetadata: merged.metadata as any, lastDeviceId: upload.deviceId, lastOperationId: upload.operationId, lastSyncedAt: new Date(), version: { increment: 1 } } });
     if (claimed.count !== 1) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the offline changes were being merged.", { cloudRevision: state.cloudRevision });
+    const currentStartedAt = current.snapshot.workspace.startedAt;
+    const mergedStartedAt = merged.snapshot.workspace.startedAt;
+    const sessionChanged = currentStartedAt !== mergedStartedAt;
+    const sessionEnded = !current.snapshot.workspace.endedAt && Boolean(merged.snapshot.workspace.endedAt);
+    if (sessionChanged || sessionEnded) {
+      const finalSnapshot = sessionChanged ? current.snapshot : merged.snapshot;
+      const endedAt = sessionChanged ? new Date(mergedStartedAt) : new Date(merged.snapshot.workspace.endedAt!);
+      await finalizePublicRankingFromSnapshot(tx, queueMasterId, currentStartedAt, endedAt, finalSnapshot);
+    }
     await reconcileSyncSnapshot(tx, queueMasterId, merged.snapshot, upload.auditEvents, upload.operationId);
     const updated = await tx.accountSyncState.findUnique({ where: { id: state.id } });
     if (!updated) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the snapshot was being saved.");
@@ -233,6 +256,14 @@ export async function persistSyncSnapshot(tx: SyncDatabase, upload: SyncUpload, 
     },
   });
   if (claimed.count !== 1) throw conflict("SYNC_CLOUD_CHANGED", "Cloud data changed on another device.", { cloudRevision: state.cloudRevision });
+  const current = readCurrent ? await readCurrent(tx) : { snapshot: upload.snapshot };
+  const sessionChanged = current.snapshot.workspace.startedAt !== upload.snapshot.workspace.startedAt;
+  const sessionEnded = !current.snapshot.workspace.endedAt && Boolean(upload.snapshot.workspace.endedAt);
+  if (sessionChanged || sessionEnded) {
+    const finalSnapshot = sessionChanged ? current.snapshot : upload.snapshot;
+    const endedAt = sessionChanged ? new Date(upload.snapshot.workspace.startedAt) : new Date(upload.snapshot.workspace.endedAt!);
+    await finalizePublicRankingFromSnapshot(tx, queueMasterId, current.snapshot.workspace.startedAt, endedAt, finalSnapshot);
+  }
   await reconcileSyncSnapshot(tx, queueMasterId, upload.snapshot, upload.auditEvents, upload.operationId);
   const updated = await tx.accountSyncState.findUnique({ where: { id: state.id } });
   if (!updated) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the snapshot was being saved.");
