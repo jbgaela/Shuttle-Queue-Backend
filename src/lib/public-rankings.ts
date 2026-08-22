@@ -29,6 +29,7 @@ export type PublicRankingMatch = {
 export type PublicRankingSnapshot = {
   schemaVersion: typeof PUBLIC_RANKING_SNAPSHOT_VERSION;
   capturedAt: string;
+  firstMatchStartedAt?: string | null;
   rankings: PublicRankingRow[];
   matches: PublicRankingMatch[];
 };
@@ -45,6 +46,17 @@ type RankingPlayer = {
 
 function publicKey(publicationId: string, entityId: string) {
   return createHash("sha256").update(`${publicationId}:${entityId}`).digest("base64url");
+}
+
+export function earliestMatchStartedAt(matches: Array<{ startedAt?: Date | string | null }>): string | null {
+  let earliest: number | null = null;
+  for (const match of matches) {
+    if (match.startedAt === null || match.startedAt === undefined) continue;
+    const timestamp = match.startedAt instanceof Date ? match.startedAt.getTime() : new Date(match.startedAt).getTime();
+    if (!Number.isFinite(timestamp) || (earliest !== null && timestamp >= earliest)) continue;
+    earliest = timestamp;
+  }
+  return earliest === null ? null : new Date(earliest).toISOString();
 }
 
 export function publicPlayerKey(publicationId: string, queuePlayerId: string) {
@@ -96,10 +108,11 @@ export function publicMatchFromRecord(match: any, publicationId: string): Public
   };
 }
 
-export function publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches }: { publicationId: string; capturedAt: Date; rows: any[]; matches: any[] }): PublicRankingSnapshot {
+export function publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches, firstMatchStartedAt }: { publicationId: string; capturedAt: Date; rows: any[]; matches: any[]; firstMatchStartedAt?: Date | string | null }): PublicRankingSnapshot {
   return {
     schemaVersion: PUBLIC_RANKING_SNAPSHOT_VERSION,
     capturedAt: capturedAt.toISOString(),
+    firstMatchStartedAt: firstMatchStartedAt === undefined ? earliestMatchStartedAt(matches) : earliestMatchStartedAt([{ startedAt: firstMatchStartedAt }]),
     rankings: rows.map((row, index) => publicRankingRow(row, index, publicationId)),
     matches: matches
       .map((match) => publicMatchFromRecord(match, publicationId))
@@ -118,11 +131,13 @@ function cloudMatchRecord(match: CloudSnapshotV2["matches"][number], names: Map<
 
 export function publicRankingSnapshotFromCloudSnapshot(snapshot: CloudSnapshotV2, publicationId: string, capturedAt: Date): PublicRankingSnapshot {
   const names = new Map(snapshot.queuePlayers.map((player) => [player.id, player.displayName]));
+  const allMatches = snapshot.matches ?? [];
   return publicRankingSnapshotFromRecords({
     publicationId,
     capturedAt,
     rows: [...snapshot.queuePlayers].sort((left, right) => right.wins - left.wins || right.matchesPlayed - left.matchesPlayed || normalizeName(left.displayName).localeCompare(normalizeName(right.displayName))).map((player) => ({ ...player, displayNameSnapshot: player.displayName })),
-    matches: (snapshot.matches ?? []).filter((match) => match.status === "COMPLETED").map((match) => cloudMatchRecord(match, names)),
+    firstMatchStartedAt: earliestMatchStartedAt(allMatches),
+    matches: allMatches.filter((match) => match.status === "COMPLETED").map((match) => cloudMatchRecord(match, names)),
   });
 }
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { activePublicRankingWhere, isPublicRankingSnapshot, publicHistoryFromSnapshot, publicPlayerKey, publicRankingSnapshotFromCloudSnapshot, publicRankingSnapshotFromRecords } from "../../src/lib/public-rankings.js";
+import { activePublicRankingWhere, earliestMatchStartedAt, isPublicRankingSnapshot, publicHistoryFromSnapshot, publicPlayerKey, publicRankingSnapshotFromCloudSnapshot, publicRankingSnapshotFromRecords } from "../../src/lib/public-rankings.js";
 import { publicRankingRowsFromSnapshot } from "../../src/lib/sync-persistence.js";
 
 test("active public ranking filter includes null and missing revokedAt values", () => {
@@ -8,6 +8,24 @@ test("active public ranking filter includes null and missing revokedAt values", 
     enabled: true,
     OR: [{ revokedAt: null }, { revokedAt: { isSet: false } }],
   });
+});
+
+test("earliest match start ignores queued matches and normalizes Date and ISO values", () => {
+  assert.equal(earliestMatchStartedAt([
+    { startedAt: null },
+    { startedAt: "2025-01-02T12:00:00.000Z" },
+    { startedAt: new Date("2025-01-02T11:00:00.000Z") },
+    {},
+    { startedAt: "2025-01-02T13:00:00.000Z" },
+  ]), "2025-01-02T11:00:00.000Z");
+  assert.equal(earliestMatchStartedAt([{ startedAt: null }, {}]), null);
+});
+
+test("cancelled matches with a start timestamp count as the first match", () => {
+  assert.equal(earliestMatchStartedAt([
+    { startedAt: "2025-01-02T12:00:00.000Z" },
+    { startedAt: "2025-01-02T11:00:00.000Z" },
+  ]), "2025-01-02T11:00:00.000Z");
 });
 
 test("public ranking snapshots include every joined player and hide private fields", () => {
@@ -80,11 +98,27 @@ test("database and offline snapshot history mappers produce the same public matc
     publicationId: "publication",
     capturedAt,
     rows: [{ id: "p1", displayNameSnapshot: "Alice", wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 42, pointsAgainst: 35 }],
-    matches: [{ id: "match-1", status: "COMPLETED", completedAt: new Date("2025-01-02T12:00:00.000Z"), winnerTeam: "A", currentRevisionId: "revision-1", participants: [{ queuePlayerId: "p1", team: "A", teamSlot: 1, queuePlayer: { displayNameSnapshot: "Alice" } }], scoreRevisions: [{ id: "revision-1", winnerTeam: "A", games: [{ gameNumber: 1, teamAScore: 21, teamBScore: 18, winnerTeam: "A" }] }] }],
+    matches: [{ id: "match-1", status: "COMPLETED", startedAt: new Date("2025-01-02T11:00:00.000Z"), completedAt: new Date("2025-01-02T12:00:00.000Z"), winnerTeam: "A", currentRevisionId: "revision-1", participants: [{ queuePlayerId: "p1", team: "A", teamSlot: 1, queuePlayer: { displayNameSnapshot: "Alice" } }], scoreRevisions: [{ id: "revision-1", winnerTeam: "A", games: [{ gameNumber: 1, teamAScore: 21, teamBScore: 18, winnerTeam: "A" }] }] }],
   });
-  const cloudSnapshot = publicRankingSnapshotFromCloudSnapshot({ queueMasterId: "queue", queuePlayers: [{ id: "p1", displayName: "Alice", wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 42, pointsAgainst: 35 }], matches: [{ id: "match-1", status: "COMPLETED", completedAt: "2025-01-02T12:00:00.000Z", winnerTeam: "A", currentRevisionId: "revision-1", participants: [{ queuePlayerId: "p1", team: "A", teamSlot: 1 }], scoreRevisions: [{ id: "revision-1", winnerTeam: "A", games: [{ gameNumber: 1, teamAScore: 21, teamBScore: 18, winnerTeam: "A" }] }] }] } as unknown as Parameters<typeof publicRankingSnapshotFromCloudSnapshot>[0], "publication", capturedAt);
+  const cloudSnapshot = publicRankingSnapshotFromCloudSnapshot({ queueMasterId: "queue", queuePlayers: [{ id: "p1", displayName: "Alice", wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 42, pointsAgainst: 35 }], matches: [{ id: "match-1", status: "COMPLETED", startedAt: "2025-01-02T11:00:00.000Z", completedAt: "2025-01-02T12:00:00.000Z", winnerTeam: "A", currentRevisionId: "revision-1", participants: [{ queuePlayerId: "p1", team: "A", teamSlot: 1 }], scoreRevisions: [{ id: "revision-1", winnerTeam: "A", games: [{ gameNumber: 1, teamAScore: 21, teamBScore: 18, winnerTeam: "A" }] }] }] } as unknown as Parameters<typeof publicRankingSnapshotFromCloudSnapshot>[0], "publication", capturedAt);
   assert.deepEqual(databaseSnapshot.matches, cloudSnapshot.matches);
+  assert.equal(databaseSnapshot.firstMatchStartedAt, "2025-01-02T11:00:00.000Z");
+  assert.equal(cloudSnapshot.firstMatchStartedAt, databaseSnapshot.firstMatchStartedAt);
   assert.equal(isPublicRankingSnapshot(databaseSnapshot), true);
   assert.equal(isPublicRankingSnapshot({ capturedAt: capturedAt.toISOString(), rankings: databaseSnapshot.rankings }), false);
   assert.equal(publicHistoryFromSnapshot(databaseSnapshot, "unknown"), null);
+});
+
+test("offline snapshots preserve the earliest started match even when it is not completed", () => {
+  const snapshot = publicRankingSnapshotFromCloudSnapshot({
+    queueMasterId: "queue",
+    queuePlayers: [],
+    matches: [
+      { id: "queued", status: "QUEUED", startedAt: null },
+      { id: "cancelled", status: "CANCELLED", startedAt: "2025-01-02T10:00:00.000Z" },
+      { id: "playing", status: "IN_PROGRESS", startedAt: "2025-01-02T11:00:00.000Z" },
+    ],
+  } as unknown as Parameters<typeof publicRankingSnapshotFromCloudSnapshot>[0], "publication", new Date("2025-01-02T12:00:00.000Z"));
+  assert.equal(snapshot.firstMatchStartedAt, "2025-01-02T10:00:00.000Z");
+  assert.deepEqual(snapshot.matches, []);
 });
