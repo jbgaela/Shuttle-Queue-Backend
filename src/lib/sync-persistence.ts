@@ -1,21 +1,20 @@
 import { mergeSyncSnapshots, type CloudSnapshotV2, type SyncMetadata } from "@shuttle-queue/domain";
 import { conflict } from "./errors.js";
 import { normalizeName } from "./normalize.js";
+import { publicRankingSnapshotFromCloudSnapshot } from "./public-rankings.js";
 
 type SyncDatabase = any;
 const DEFAULT_LATE_ARRIVAL_GRACE_MINUTES = 10;
 
 export function publicRankingRowsFromSnapshot(snapshot: CloudSnapshotV2) {
-  return [...snapshot.queuePlayers]
-    .sort((left, right) => right.wins - left.wins || right.matchesPlayed - left.matchesPlayed || normalizeName(left.displayName).localeCompare(normalizeName(right.displayName)))
-    .map((player, index) => ({ rank: index + 1, player: player.displayName, matchesPlayed: player.matchesPlayed, wins: player.wins, losses: player.losses, winRateBasisPoints: player.matchesPlayed ? Math.floor((player.wins * 10_000) / player.matchesPlayed) : 0, pointsFor: player.pointsFor, pointsAgainst: player.pointsAgainst, pointDifferential: player.pointsFor - player.pointsAgainst }));
+  return publicRankingSnapshotFromCloudSnapshot(snapshot, snapshot.queueMasterId, new Date()).rankings;
 }
 
 async function finalizePublicRankingFromSnapshot(tx: SyncDatabase, queueMasterId: string, sessionStartedAt: string, sessionEndedAt: Date, snapshot: CloudSnapshotV2) {
   if (!tx.publicRankingPublication?.findFirst) return;
   const publication = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: new Date(sessionStartedAt) } });
   if (!publication || publication.finalizedAt) return;
-  await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { sessionEndedAt, finalizedAt: sessionEndedAt, finalSnapshot: { capturedAt: sessionEndedAt.toISOString(), rankings: publicRankingRowsFromSnapshot(snapshot) }, version: { increment: 1 } } });
+  await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { sessionEndedAt, finalizedAt: sessionEndedAt, finalSnapshot: publicRankingSnapshotFromCloudSnapshot(snapshot, publication.id, sessionEndedAt), version: { increment: 1 } } });
   await tx.auditLog.create({ data: { queueMasterId, action: "PUBLIC_RANKINGS_FINALIZED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Public rankings finalized during offline synchronization", beforeJson: { sessionStartedAt }, afterJson: { sessionEndedAt: sessionEndedAt.toISOString() }, requestId: `offline:sync:${sessionEndedAt.getTime()}` } });
 }
 

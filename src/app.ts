@@ -23,7 +23,7 @@ import { persistSyncSnapshot, type SyncUpload } from "./lib/sync-persistence.js"
 import { clearLoginFailures, clearSessionCookie, currentCsrfToken, issueSession, passwordHash, recordLoginFailure, requireAuth, requireMutationOrigin, requireSuperAdmin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
 import { auditLogData, type AuditValues } from "./lib/audit.js";
 import { datePartsForInstant, inclusiveMinuteCutoff } from "./lib/timezone.js";
-import { activePublicRankingWhere } from "./lib/public-rankings.js";
+import { activePublicRankingWhere, isPublicRankingSnapshot, publicHistoryFromSnapshot, publicMatchFromRecord, publicPlayerKey, publicRankingSnapshotFromRecords, PUBLIC_RANKING_MATCH_LIMIT } from "./lib/public-rankings.js";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 
 const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "password", "passwordHash"] });
@@ -559,16 +559,13 @@ api.get("/history", requireAuth, route(async (request, response) => { const quer
 function rankingRow(row: any, index: number) {
   return { rank: index + 1, queuePlayerId: row.id, player: row.displayNameSnapshot, playerId: row.playerId, gender: row.genderSnapshot, skillLevel: row.skillLevelSnapshot, matchesPlayed: row.matchesPlayed, wins: row.wins, losses: row.losses, winRateBasisPoints: row.matchesPlayed ? Math.floor((row.wins * 10000) / row.matchesPlayed) : 0, pointsFor: row.pointsFor, pointsAgainst: row.pointsAgainst, pointDifferential: row.pointsFor - row.pointsAgainst };
 }
-function publicRankingRow(row: any, index: number) {
-  const ranking = rankingRow(row, index);
-  return { rank: ranking.rank, player: ranking.player, matchesPlayed: ranking.matchesPlayed, wins: ranking.wins, losses: ranking.losses, winRateBasisPoints: ranking.winRateBasisPoints, pointsFor: ranking.pointsFor, pointsAgainst: ranking.pointsAgainst, pointDifferential: ranking.pointDifferential };
-}
 async function rankingRows(queueMasterId: string, database = db) {
   return database.queuePlayer.findMany({ where: { queueMasterId }, orderBy: [{ wins: "desc" }, { matchesPlayed: "desc" }, { normalizedNameSnapshot: "asc" }] });
 }
-async function publicRankingSnapshot(queueMasterId: string, capturedAt = new Date(), database = db) {
+async function publicRankingSnapshot(queueMasterId: string, publicationId: string, capturedAt = new Date(), database = db) {
   const rows = await rankingRows(queueMasterId, database);
-  return { capturedAt: capturedAt.toISOString(), rankings: rows.map(publicRankingRow) };
+  const matches = await database.match.findMany({ where: { queueMasterId, status: MatchStatus.COMPLETED }, include: { participants: { include: { queuePlayer: true } }, scoreRevisions: { include: { games: true } } }, orderBy: { completedAt: "desc" }, take: PUBLIC_RANKING_MATCH_LIMIT });
+  return publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches });
 }
 function publicPublicationState(publication: any) {
   return publication.revokedAt || !publication.enabled ? "REVOKED" : publication.finalizedAt ? "FINAL" : "LIVE";
@@ -579,7 +576,7 @@ function publicPublicationView(publication: any, includeToken = false) {
 async function finalizePublicRankingPublication(tx: any, queueMasterId: string, workspace: any, endedAt: Date) {
   const publication = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: workspace.startedAt } });
   if (!publication || publication.finalizedAt) return publication;
-  const finalSnapshot = await publicRankingSnapshot(queueMasterId, endedAt, tx);
+  const finalSnapshot = await publicRankingSnapshot(queueMasterId, publication.id, endedAt, tx);
   const finalized = await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { sessionEndedAt: endedAt, finalizedAt: endedAt, finalSnapshot, version: { increment: 1 } } });
   await tx.auditLog.create({ data: { queueMasterId, action: "PUBLIC_RANKINGS_FINALIZED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Public rankings finalized with the session", afterJson: { sessionEndedAt: endedAt.toISOString() }, requestId: `system:public-ranking:${endedAt.getTime()}` } });
   return finalized;
@@ -604,7 +601,7 @@ api.post("/workspace/public-rankings/publish", requireAuth, requireMutationOrigi
       ? await tx.publicRankingPublication.update({ where: { id: existing.id }, data: { publicToken: randomUUID(), enabled: true, publishedAt: now, revokedAt: null, version: { increment: 1 } } })
       : await tx.publicRankingPublication.create({ data: { queueMasterId, sessionStartedAt: workspace.startedAt, publicToken: randomUUID(), enabled: true, publishedAt: now, revokedAt: null } });
     if (workspace.endedAt && !publication.finalizedAt) {
-      const finalSnapshot = await publicRankingSnapshot(queueMasterId, workspace.endedAt, tx);
+      const finalSnapshot = await publicRankingSnapshot(queueMasterId, publication.id, workspace.endedAt, tx);
       const finalized = await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { sessionEndedAt: workspace.endedAt, finalizedAt: workspace.endedAt, finalSnapshot, version: { increment: 1 } } });
       await tx.auditLog.create({ data: { queueMasterId, action: existing ? "PUBLIC_RANKINGS_REPUBLISHED" : "PUBLIC_RANKINGS_PUBLISHED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Queue Master published final session rankings", afterJson: { sessionStartedAt: workspace.startedAt.toISOString(), finalizedAt: workspace.endedAt.toISOString() }, requestId: String(request.id ?? randomUUID()) } });
       return finalized;
@@ -635,16 +632,42 @@ api.get("/public/rankings/:token", rateLimit({ windowMs: 60_000, limit: 120, sta
   const publication = await db.publicRankingPublication.findFirst({ where: { publicToken: token, ...activePublicRankingWhere() } });
   if (!publication) throw notFound("Public rankings are not available.");
   response.setHeader("Cache-Control", "no-store");
-  if (publication.finalizedAt && publication.finalSnapshot) {
-    const snapshot = publication.finalSnapshot as { capturedAt: string; rankings: unknown[] };
-    responseData(response, { sessionStartedAt: publication.sessionStartedAt, sessionEndedAt: publication.sessionEndedAt, state: "FINAL", serverTime: new Date().toISOString(), lastUpdatedAt: snapshot.capturedAt, rankings: snapshot.rankings });
+  if (publication.finalizedAt) {
+    if (!publication.finalSnapshot || typeof publication.finalSnapshot !== "object") throw notFound("Public rankings are not available.");
+    const snapshot = publication.finalSnapshot as { capturedAt: string; rankings: unknown[]; matches?: unknown[]; schemaVersion?: number };
+    responseData(response, { sessionStartedAt: publication.sessionStartedAt, sessionEndedAt: publication.sessionEndedAt, state: "FINAL", serverTime: new Date().toISOString(), lastUpdatedAt: snapshot.capturedAt, historyAvailable: isPublicRankingSnapshot(snapshot), rankings: snapshot.rankings });
     return;
   }
   const workspace = await db.queueWorkspace.findUnique({ where: { queueMasterId: publication.queueMasterId } });
   if (!workspace || workspace.startedAt.getTime() !== publication.sessionStartedAt.getTime()) throw notFound("Public rankings are not available.");
   const rows = await rankingRows(publication.queueMasterId);
   const updatedAt = rows.reduce((latest: Date, row: any) => row.updatedAt > latest ? row.updatedAt : latest, workspace.updatedAt);
-  responseData(response, { sessionStartedAt: publication.sessionStartedAt, sessionEndedAt: workspace.endedAt, state: workspace.endedAt ? "FINAL" : "LIVE", serverTime: new Date().toISOString(), lastUpdatedAt: updatedAt, rankings: rows.map(publicRankingRow) });
+  responseData(response, { sessionStartedAt: publication.sessionStartedAt, sessionEndedAt: workspace.endedAt, state: workspace.endedAt ? "FINAL" : "LIVE", serverTime: new Date().toISOString(), lastUpdatedAt: updatedAt, historyAvailable: true, rankings: rows.map((row: any, index: number) => ({ rank: index + 1, playerKey: publicPlayerKey(publication.id, row.id), player: row.displayNameSnapshot, matchesPlayed: row.matchesPlayed, wins: row.wins, losses: row.losses, winRateBasisPoints: row.matchesPlayed ? Math.floor((row.wins * 10000) / row.matchesPlayed) : 0, pointsFor: row.pointsFor, pointsAgainst: row.pointsAgainst, pointDifferential: row.pointsFor - row.pointsAgainst })) });
+}));
+api.get("/public/rankings/:token/players/:playerKey/history", rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: "draft-8", legacyHeaders: false }), route(async (request, response) => {
+  const tokenValue = String(request.params.token);
+  const playerKey = String(request.params.playerKey);
+  if (!idSchema.safeParse(tokenValue).success || !playerKey) throw notFound("Public rankings are not available.");
+  const publication = await db.publicRankingPublication.findFirst({ where: { publicToken: tokenValue, ...activePublicRankingWhere() } });
+  if (!publication) throw notFound("Public rankings are not available.");
+  response.setHeader("Cache-Control", "no-store");
+  if (publication.finalizedAt) {
+    if (!publication.finalSnapshot || typeof publication.finalSnapshot !== "object") throw notFound("Public rankings are not available.");
+    const snapshot = publication.finalSnapshot;
+    if (!isPublicRankingSnapshot(snapshot)) throw notFound("Public rankings are not available.");
+    const history = publicHistoryFromSnapshot(snapshot, playerKey);
+    if (!history) throw notFound("Public rankings are not available.");
+    responseData(response, history);
+    return;
+  }
+  const workspace = await db.queueWorkspace.findUnique({ where: { queueMasterId: publication.queueMasterId } });
+  if (!workspace || workspace.startedAt.getTime() !== publication.sessionStartedAt.getTime()) throw notFound("Public rankings are not available.");
+  const rows = await rankingRows(publication.queueMasterId);
+  const player = rows.find((row: any) => publicPlayerKey(publication.id, row.id) === playerKey);
+  if (!player) throw notFound("Public rankings are not available.");
+  const matches = await db.match.findMany({ where: { queueMasterId: publication.queueMasterId, status: MatchStatus.COMPLETED, participants: { some: { queuePlayerId: player.id } } }, include: { participants: { include: { queuePlayer: true } }, scoreRevisions: { include: { games: true } } }, orderBy: { completedAt: "desc" }, take: PUBLIC_RANKING_MATCH_LIMIT });
+  const history = { player: { playerKey, player: player.displayNameSnapshot }, matches: matches.map((match: any) => publicMatchFromRecord(match, publication.id)).filter(Boolean).map((match: any) => ({ matchKey: match.matchKey, completedAt: match.completedAt, winnerTeam: match.winnerTeam, result: match.winnerTeam && match.participants.some((participant: any) => participant.playerKey === playerKey && participant.team === match.winnerTeam) ? "WIN" : "LOSS", teamA: match.participants.filter((participant: any) => participant.team === "A").sort((left: any, right: any) => left.teamSlot - right.teamSlot).map((participant: any) => participant.player), teamB: match.participants.filter((participant: any) => participant.team === "B").sort((left: any, right: any) => left.teamSlot - right.teamSlot).map((participant: any) => participant.player), games: match.games })) };
+  responseData(response, history);
 }));
 api.get("/queue/players/:id/history", requireAuth, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); const query = parse(historyQuerySchema, request.query); const matches = (await matchHistoryFor(authUser(request).id)).filter((match: any) => match.participants.some((p: any) => p.queuePlayerId === player.id)); const rows = matches.map((match: any) => historyMatchView(match)); let wins = 0; let pointsFor = 0; let pointsAgainst = 0; for (const match of matches) { const participant = match.participants.find((p: any) => p.queuePlayerId === player.id); const revision = match.scoreRevisions.find((r: any) => r.id === match.currentRevisionId); if (!participant || !revision) continue; const a = revision.games.reduce((sum: number, game: any) => sum + game.teamAScore, 0); const b = revision.games.reduce((sum: number, game: any) => sum + game.teamBScore, 0); pointsFor += participant.team === TeamSide.A ? a : b; pointsAgainst += participant.team === TeamSide.A ? b : a; if (participant.team === revision.winnerTeam) wins += 1; } responseData(response, { player: { queuePlayerId: player.id, playerId: player.playerId, displayName: player.displayNameSnapshot, gender: player.genderSnapshot, skillLevel: player.skillLevelSnapshot }, stats: { matchesPlayed: matches.length, wins, losses: matches.length - wins, winRateBasisPoints: matches.length ? Math.floor((wins * 10000) / matches.length) : 0, pointsFor, pointsAgainst, pointDifferential: pointsFor - pointsAgainst, averageDurationSeconds: matches.length ? Math.round(matches.map((m: any) => historyDurationSeconds(m)).filter((v: number | null): v is number => v !== null).reduce((a: number, b: number) => a + b, 0) / Math.max(1, matches.filter((m: any) => m.startedAt && m.completedAt).length)) : null, mostPlayedPartner: null, mostPlayedOpponent: null }, ...pageResult(rows, query.page, query.pageSize) }); }));
 
