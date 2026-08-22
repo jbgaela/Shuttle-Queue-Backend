@@ -111,9 +111,10 @@ export async function assertStableNaturalKeys(tx: SyncDatabase, queueMasterId: s
     const existingId = courtByName.get(key);
     if (existingId && existingId !== court.id) throw conflict("SYNC_IDENTITY_CONFLICT", "A court identity changed while offline. Download the current queue before syncing.", { entity: "court", existingId, snapshotId: court.id, normalizedName: key });
   }
-  const participantByQueuePlayer = new Map(participants.map((participant: any) => [`${participant.matchId}:${participant.queuePlayerId}`, participant.id]));
-  const participantBySlot = new Map(participants.map((participant: any) => [`${participant.matchId}:${participant.team}:${participant.teamSlot}`, participant.id]));
+  const participantByQueuePlayer = new Map<string, string>(participants.map((participant: any) => [`${participant.matchId}:${participant.queuePlayerId}`, participant.id]));
+  const participantBySlot = new Map<string, string>(participants.map((participant: any) => [`${participant.matchId}:${participant.team}:${participant.teamSlot}`, participant.id]));
   const participantById = new Map<string, any>(participants.map((participant: any) => [participant.id, participant] as [string, any]));
+  const snapshotParticipantIds = new Set(snapshot.matches.flatMap((match) => match.participants.map((participant) => participant.id)));
   const revisionByNumber = new Map(revisions.map((revision: any) => [`${revision.matchId}:${revision.revisionNumber}`, revision.id]));
   const revisionById = new Map<string, any>(revisions.map((revision: any) => [revision.id, revision] as [string, any]));
   const gameByNumber = new Map(games.map((game: any) => [`${game.scoreRevisionId}:${game.gameNumber}`, game.id]));
@@ -123,9 +124,9 @@ export async function assertStableNaturalKeys(tx: SyncDatabase, queueMasterId: s
       const existingParticipant = participantById.get(participant.id);
       if (existingParticipant && (existingParticipant.matchId !== participant.matchId || existingParticipant.queuePlayerId !== participant.queuePlayerId || existingParticipant.team !== participant.team || existingParticipant.teamSlot !== participant.teamSlot)) throw conflict("SYNC_IDENTITY_CONFLICT", "A match participant was remapped while offline. Download the current queue before syncing.", { entity: "matchParticipant", existingId: participant.id, snapshotId: participant.id });
       const queuePlayerId = participantByQueuePlayer.get(`${match.id}:${participant.queuePlayerId}`);
-      if (queuePlayerId && queuePlayerId !== participant.id) throw conflict("SYNC_IDENTITY_CONFLICT", "A match participant identity changed while offline. Download the current queue before syncing.", { entity: "matchParticipant", existingId: queuePlayerId, snapshotId: participant.id, matchId: match.id, queuePlayerId: participant.queuePlayerId });
+      if (queuePlayerId && queuePlayerId !== participant.id && snapshotParticipantIds.has(queuePlayerId)) throw conflict("SYNC_IDENTITY_CONFLICT", "A match participant identity changed while offline. Download the current queue before syncing.", { entity: "matchParticipant", existingId: queuePlayerId, snapshotId: participant.id, matchId: match.id, queuePlayerId: participant.queuePlayerId });
       const slotId = participantBySlot.get(`${match.id}:${participant.team}:${participant.teamSlot}`);
-      if (slotId && slotId !== participant.id) throw conflict("SYNC_IDENTITY_CONFLICT", "A match participant slot changed while offline. Download the current queue before syncing.", { entity: "matchParticipant", existingId: slotId, snapshotId: participant.id, matchId: match.id, team: participant.team, teamSlot: participant.teamSlot });
+      if (slotId && slotId !== participant.id && snapshotParticipantIds.has(slotId)) throw conflict("SYNC_IDENTITY_CONFLICT", "A match participant slot changed while offline. Download the current queue before syncing.", { entity: "matchParticipant", existingId: slotId, snapshotId: participant.id, matchId: match.id, team: participant.team, teamSlot: participant.teamSlot });
     }
     for (const revision of match.scoreRevisions) {
       const existingRevision = revisionById.get(revision.id);
@@ -172,6 +173,8 @@ export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: str
   for (const player of snapshot.queuePlayers) await write(tx.queuePlayer, player.id, queuePlayerData(player), ids.queuePlayers, true);
   for (const court of snapshot.courts) await write(tx.court, court.id, courtData(court), ids.courts, true);
   for (const match of snapshot.matches) await write(tx.match, match.id, matchData(match), ids.matches, true);
+  const participantIds = snapshot.matches.flatMap((match) => match.participants.map((participant) => participant.id));
+  await tx.matchParticipant.deleteMany({ where: { match: { queueMasterId }, ...(participantIds.length ? { id: { notIn: participantIds } } : {}) } });
   for (const match of snapshot.matches) {
     for (const participant of match.participants) await write(tx.matchParticipant, participant.id, participantData(participant), ids.participants);
     for (const revision of match.scoreRevisions) {
@@ -185,13 +188,11 @@ export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: str
   const queuePlayerIds = snapshot.queuePlayers.map((player) => player.id);
   const courtIds = snapshot.courts.map((court) => court.id);
   const matchIds = snapshot.matches.map((match) => match.id);
-  const participantIds = snapshot.matches.flatMap((match) => match.participants.map((participant) => participant.id));
   const revisionIds = snapshot.matches.flatMap((match) => match.scoreRevisions.map((revision) => revision.id));
   const gameIds = snapshot.matches.flatMap((match) => match.scoreRevisions.flatMap((revision) => revision.games.map((game) => game.id)));
   const paymentIds = snapshot.payments.map((payment) => payment.id);
   await tx.matchGame.deleteMany({ where: { scoreRevision: { match: { queueMasterId } }, ...(gameIds.length ? { id: { notIn: gameIds } } : {}) } });
   await tx.matchScoreRevision.deleteMany({ where: { match: { queueMasterId }, ...(revisionIds.length ? { id: { notIn: revisionIds } } : {}) } });
-  await tx.matchParticipant.deleteMany({ where: { match: { queueMasterId }, ...(participantIds.length ? { id: { notIn: participantIds } } : {}) } });
   await tx.match.deleteMany({ where: { queueMasterId, ...(matchIds.length ? { id: { notIn: matchIds } } : {}) } });
   await tx.payment.deleteMany({ where: { queueMasterId, ...(paymentIds.length ? { id: { notIn: paymentIds } } : {}) } });
   await tx.queuePlayer.deleteMany({ where: { queueMasterId, ...(queuePlayerIds.length ? { id: { notIn: queuePlayerIds } } : {}) } });
