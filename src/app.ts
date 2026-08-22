@@ -21,7 +21,9 @@ import { validateScores, type ScoreInput } from "./lib/score.js";
 import { normalizeQueuePlayerSnapshotFields } from "./lib/sync-snapshot.js";
 import { persistSyncSnapshot, type SyncUpload } from "./lib/sync-persistence.js";
 import { clearLoginFailures, clearSessionCookie, currentCsrfToken, issueSession, passwordHash, recordLoginFailure, requireAuth, requireMutationOrigin, requireSuperAdmin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
+import { auditLogData, type AuditValues } from "./lib/audit.js";
 import { datePartsForInstant, inclusiveMinuteCutoff } from "./lib/timezone.js";
+import { activePublicRankingWhere } from "./lib/public-rankings.js";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 
 const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "password", "passwordHash"] });
@@ -214,7 +216,6 @@ async function validateSuggestionRequest(request: Request, tokenValue: string, t
   if (token.queueMasterId !== authUser(request).id || token.revision !== workspace.matchmakingRevision || Number(token.expiresAt) < Date.now() || !validMode || !validStrength || typeof token.key !== "string" || !Array.isArray(token.teamA) || !Array.isArray(token.teamB) || (!adjusted && (JSON.stringify(token.teamA) !== JSON.stringify(teamA) || JSON.stringify(token.teamB) !== JSON.stringify(teamB)))) throw conflict("SUGGESTION_STALE", "Generate a new suggestion.");
   return token;
 }
-function auditData(request: Request, values: { action: string; entityType: string; entityId: string; reason?: string; before?: unknown; after?: unknown }) { return { queueMasterId: authUser(request).id, ...values, entityType: values.action === "PLAYERS_DELETED" ? "QUEUE_PLAYER" : values.entityType, beforeJson: values.before as Prisma.InputJsonValue | undefined, afterJson: values.after as Prisma.InputJsonValue | undefined, requestId: String(request.id ?? randomUUID()) }; }
 async function rebuildQueueStats(tx: any, queueMasterId: string) {
   await tx.queuePlayer.updateMany({ where: { queueMasterId }, data: { matchesPlayed: 0, wins: 0, losses: 0, pointsFor: 0, pointsAgainst: 0 } });
   const completed = await tx.match.findMany({ where: { queueMasterId, status: MatchStatus.COMPLETED }, include: { participants: true, scoreRevisions: { include: { games: true } } } });
@@ -228,7 +229,7 @@ async function rebuildQueueStats(tx: any, queueMasterId: string) {
     }
   }
 }
-async function audit(tx: any, request: Request, values: Parameters<typeof auditData>[1]) { await tx.auditLog.create({ data: auditData(request, values) }); if (values.action === "PLAYERS_DELETED") await rebuildQueueStats(tx, authUser(request).id); }
+async function audit(tx: any, request: Request, values: AuditValues) { await tx.auditLog.create({ data: auditLogData(authUser(request).id, String(request.id ?? randomUUID()), values) }); if (values.action === "PLAYERS_DELETED") await rebuildQueueStats(tx, authUser(request).id); }
 
 async function workspaceFor(request: Request) { await ensureWorkspace(authUser(request).id); return db.queueWorkspace.findUnique({ where: { queueMasterId: authUser(request).id } }); }
 async function activeWorkspaceFor(request: Request) { const workspace = await workspaceFor(request); if (workspace?.endedAt) throw conflict("SESSION_ENDED", "This queue session has ended. Start a fresh queue before continuing operations."); return workspace; }
@@ -587,7 +588,7 @@ api.get("/rankings", requireAuth, route(async (request, response) => { const row
 api.get("/workspace/public-rankings", requireAuth, route(async (request, response) => {
   const queueMasterId = authUser(request).id;
   const workspace = await workspaceFor(request);
-  const publications = await db.publicRankingPublication.findMany({ where: { queueMasterId, enabled: true, revokedAt: null }, orderBy: { sessionStartedAt: "desc" } });
+  const publications = await db.publicRankingPublication.findMany({ where: { queueMasterId, ...activePublicRankingWhere() }, orderBy: { sessionStartedAt: "desc" } });
   const current = publications.find((publication: any) => publication.sessionStartedAt.getTime() === workspace.startedAt.getTime());
   responseData(response, { current: current ? publicPublicationView(current, true) : null, archives: publications.filter((publication: any) => publication.id !== current?.id).map((publication: any) => publicPublicationView(publication, true)) });
 }));
@@ -601,7 +602,7 @@ api.post("/workspace/public-rankings/publish", requireAuth, requireMutationOrigi
     const now = new Date();
     const publication = existing
       ? await tx.publicRankingPublication.update({ where: { id: existing.id }, data: { publicToken: randomUUID(), enabled: true, publishedAt: now, revokedAt: null, version: { increment: 1 } } })
-      : await tx.publicRankingPublication.create({ data: { queueMasterId, sessionStartedAt: workspace.startedAt, publicToken: randomUUID(), enabled: true, publishedAt: now } });
+      : await tx.publicRankingPublication.create({ data: { queueMasterId, sessionStartedAt: workspace.startedAt, publicToken: randomUUID(), enabled: true, publishedAt: now, revokedAt: null } });
     if (workspace.endedAt && !publication.finalizedAt) {
       const finalSnapshot = await publicRankingSnapshot(queueMasterId, workspace.endedAt, tx);
       const finalized = await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { sessionEndedAt: workspace.endedAt, finalizedAt: workspace.endedAt, finalSnapshot, version: { increment: 1 } } });
@@ -631,7 +632,7 @@ api.get("/public/rankings/:token", rateLimit({ windowMs: 60_000, limit: 120, sta
   const tokenValue = String(request.params.token);
   if (!idSchema.safeParse(tokenValue).success) throw notFound("Public rankings are not available.");
   const token = tokenValue;
-  const publication = await db.publicRankingPublication.findFirst({ where: { publicToken: token, enabled: true, revokedAt: null } });
+  const publication = await db.publicRankingPublication.findFirst({ where: { publicToken: token, ...activePublicRankingWhere() } });
   if (!publication) throw notFound("Public rankings are not available.");
   response.setHeader("Cache-Control", "no-store");
   if (publication.finalizedAt && publication.finalSnapshot) {

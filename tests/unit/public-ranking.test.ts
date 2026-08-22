@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { activePublicRankingWhere } from "../../src/lib/public-rankings.js";
 import { publicRankingRowsFromSnapshot } from "../../src/lib/sync-persistence.js";
+
+test("active public ranking filter includes null and missing revokedAt values", () => {
+  assert.deepEqual(activePublicRankingWhere(), {
+    enabled: true,
+    OR: [{ revokedAt: null }, { revokedAt: { isSet: false } }],
+  });
+});
 
 test("public ranking snapshots include every joined player and hide private fields", () => {
   const rows = publicRankingRowsFromSnapshot({ queuePlayers: [
