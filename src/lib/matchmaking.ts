@@ -1,4 +1,5 @@
 import { Gender, MatchmakingMode, QueuePlayerStatus } from "@prisma/client";
+import { suggestMatch as suggestDomainMatch, undefeatedChallengePlayers as domainUndefeatedChallengePlayers, type MatchHistory as DomainMatchHistory, type MatchPlayer as DomainMatchPlayer } from "@shuttle-queue/domain";
 
 export type MatchPlayer = {
   id: string;
@@ -8,6 +9,8 @@ export type MatchPlayer = {
   skillLevel: string;
   status: QueuePlayerStatus;
   gamesPlayed: number;
+  wins?: number;
+  losses?: number;
   queueEnteredAt: Date | null;
   lastMatchEndedAt: Date | null;
   manualPriority: number;
@@ -21,7 +24,7 @@ export type MatchmakingOptions = { strengthGap?: 1 | 2 | 3; minimumRestMinutes?:
 export type Suggestion = { mode: MatchmakingMode; teamA: MatchPlayer[]; teamB: MatchPlayer[]; teamATotal: number; teamBTotal: number; difference: number; key: string; explanation: Record<string, unknown> };
 
 const DEFAULT_BALANCED_STRENGTH_GAP = 1;
-export const MATCHMAKING_ALGORITHM = "v4-upper-beginner-strict-balance";
+export const MATCHMAKING_ALGORITHM = "v5-undefeated-challenge";
 const count = (map: PairMap | undefined, a: string, b: string) => map?.get(a)?.get(b) ?? 0;
 const symmetricCount = (map: PairMap | undefined, a: string, b: string) => Math.max(count(map, a, b), count(map, b, a));
 const quartetKey = (players: MatchPlayer[]) => players.map((player) => player.id).sort().join(":");
@@ -43,6 +46,28 @@ function partnerCount(history: MatchHistory, a: string, b: string, recent: boole
 function pairStats(history: MatchHistory, players: MatchPlayer[], recent: boolean) { const values: number[] = []; for (let left = 0; left < players.length; left += 1) for (let right = left + 1; right < players.length; right += 1) values.push(encounterCount(history, players[left]!.id, players[right]!.id, recent)); return { repeatedPairs: values.filter((value) => value > 0).length, total: values.reduce((sum, value) => sum + value, 0) }; }
 function partnerRepeats(history: MatchHistory, team: MatchPlayer[], recent: boolean) { return partnerCount(history, team[0]!.id, team[1]!.id, recent); }
 function skillMix(team: MatchPlayer[]) { return Math.abs(team[0]!.skillWeight - team[1]!.skillWeight); }
+
+function suggestDomainChallenge(players: MatchPlayer[], history: MatchHistory, excludedKeys: string[], options: MatchmakingOptions): Suggestion | null {
+  const originalById = new Map(players.map((player) => [player.id, player]));
+  const input: DomainMatchPlayer[] = players.map((player) => ({ id: player.id, displayName: player.displayName, gender: player.gender, skillWeight: player.skillWeight, skillLevel: player.skillLevel as DomainMatchPlayer["skillLevel"], status: player.status as DomainMatchPlayer["status"], gamesPlayed: player.gamesPlayed, wins: player.wins, losses: player.losses, queueEnteredAt: player.queueEnteredAt?.toISOString() ?? null, lastMatchEndedAt: player.lastMatchEndedAt?.toISOString() ?? null, manualPriority: player.manualPriority, latePenaltyState: player.latePenaltyState }));
+  const result = suggestDomainMatch(input, "UNDEFEATED_CHALLENGE", history as unknown as DomainMatchHistory, excludedKeys, { minimumRestMinutes: options.minimumRestMinutes, now: options.now });
+  if (!result) return null;
+  const toLocal = (player: DomainMatchPlayer): MatchPlayer => {
+    const original = originalById.get(player.id);
+    if (!original) throw new Error("Challenge suggestion referenced an unknown player.");
+    return original;
+  };
+  return { mode: MatchmakingMode.UNDEFEATED_CHALLENGE, teamA: result.teamA.map(toLocal), teamB: result.teamB.map(toLocal), teamATotal: result.teamATotal, teamBTotal: result.teamBTotal, difference: result.difference, key: result.key, explanation: result.explanation };
+}
+
+export function undefeatedChallengePlayers(players: MatchPlayer[]) {
+  const originalById = new Map(players.map((player) => [player.id, player]));
+  const input: DomainMatchPlayer[] = players.map((player) => ({ id: player.id, displayName: player.displayName, gender: player.gender, skillWeight: player.skillWeight, skillLevel: player.skillLevel as DomainMatchPlayer["skillLevel"], status: player.status as DomainMatchPlayer["status"], gamesPlayed: player.gamesPlayed, wins: player.wins, losses: player.losses, queueEnteredAt: player.queueEnteredAt?.toISOString() ?? null, lastMatchEndedAt: player.lastMatchEndedAt?.toISOString() ?? null, manualPriority: player.manualPriority, latePenaltyState: player.latePenaltyState }));
+  return domainUndefeatedChallengePlayers(input).flatMap(({ player, rank }) => {
+    const original = originalById.get(player.id);
+    return original ? [{ player: original, rank }] : [];
+  });
+}
 export const isProhibitedGeneratedGenderMatch = (teamA: MatchPlayer[], teamB: MatchPlayer[]) =>
   teamA.length === 2 && teamB.length === 2
   && ((teamA.every((player) => player.gender === Gender.FEMALE) && teamB.every((player) => player.gender === Gender.MALE))
@@ -52,13 +77,14 @@ export const validateBalancedLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[
   const group = [...teamA, ...teamB];
   if (![1, 2].includes(teamA.length) || teamA.length !== teamB.length || new Set(group.map((player) => player.id)).size !== group.length) return "Choose unique players with equal team sizes for singles or doubles.";
   const spread = Math.max(...group.map((player) => player.skillWeight)) - Math.min(...group.map((player) => player.skillWeight));
-  if (spread > strengthGap) return `Balanced matchups require all player strengths to be within ${strengthGap}.`;
+  if (spread > strengthGap) return `Handicap matchups require a player strength spread of at most ${strengthGap}.`;
   const teamDifference = Math.abs(teamA.reduce((sum, player) => sum + player.skillWeight, 0) - teamB.reduce((sum, player) => sum + player.skillWeight, 0));
-  if (teamDifference > strengthGap) return `Balanced matchups require team strength totals to be within ${strengthGap}.`;
+  if (teamDifference !== strengthGap) return `Handicap matchups require team strength totals to differ by exactly ${strengthGap}.`;
   return null;
 };
 
 export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, history: MatchHistory, excludedKeys: string[] = [], options: MatchmakingOptions = {}): Suggestion | null {
+  if (mode === MatchmakingMode.UNDEFEATED_CHALLENGE) return suggestDomainChallenge(players, history, excludedKeys, options);
   const now = (options.now ?? new Date()).getTime();
   const minimumRestMinutes = Math.max(0, options.minimumRestMinutes ?? 0);
   const strengthGap = mode === MatchmakingMode.BALANCED ? options.strengthGap ?? DEFAULT_BALANCED_STRENGTH_GAP : undefined;
@@ -93,7 +119,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
       const teamATotal = teamA.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamBTotal = teamB.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamDifference = Math.abs(teamATotal - teamBTotal);
-      if (mode === MatchmakingMode.BALANCED && teamDifference > strengthGap!) continue;
+      if (mode === MatchmakingMode.BALANCED && teamDifference !== strengthGap!) continue;
       const recentPartnerRepeats = partnerRepeats(history, teamA, true) + partnerRepeats(history, teamB, true);
       const allTimePartnerRepeats = partnerRepeats(history, teamA, false) + partnerRepeats(history, teamB, false);
       const partnerMix = skillMix(teamA) + skillMix(teamB);
@@ -104,7 +130,9 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
       const times = sortedTimes(group);
       const previouslySkippedCount = group.filter((player) => previouslySkippedPlayerIds.has(player.id)).length;
       const pendingCount = group.filter((player) => player.latePenaltyState === "PENDING").length;
-      const key: (number[] | number | string)[] = [priority, -lowestGamesCount, games[3]! - games[0]!, pendingCount, recentPairs.repeatedPairs, recentPairs.total, recentQuartetRepeats, allTimePairs.repeatedPairs, allTimePairs.total, allTimeQuartetRepeats, -previouslySkippedCount, mode === MatchmakingMode.BALANCED ? -skillSpread : mode === MatchmakingMode.SAME_SKILL ? skillSpread : 0, games, times, recentPartnerRepeats, allTimePartnerRepeats, mode === MatchmakingMode.BALANCED ? -partnerMix : 0, teamDifference, sortedPlayers.map((player) => player.id).join(","), keyString];
+      const key: (number[] | number | string)[] = mode === MatchmakingMode.BALANCED
+        ? [priority, -lowestGamesCount, games[3]! - games[0]!, pendingCount, -previouslySkippedCount, games, times, teamDifference, recentPairs.repeatedPairs, recentPairs.total, recentQuartetRepeats, allTimePairs.repeatedPairs, allTimePairs.total, allTimeQuartetRepeats, recentPartnerRepeats, allTimePartnerRepeats, -partnerMix, sortedPlayers.map((player) => player.id).join(","), keyString]
+        : [priority, -lowestGamesCount, games[3]! - games[0]!, pendingCount, recentPairs.repeatedPairs, recentPairs.total, recentQuartetRepeats, allTimePairs.repeatedPairs, allTimePairs.total, allTimeQuartetRepeats, -previouslySkippedCount, mode === MatchmakingMode.SAME_SKILL ? skillSpread : 0, games, times, recentPartnerRepeats, allTimePartnerRepeats, 0, teamDifference, sortedPlayers.map((player) => player.id).join(","), keyString];
       const suggestion: Suggestion = { mode, teamA, teamB, teamATotal, teamBTotal, difference: teamDifference, key: keyString, explanation: { algorithmVersion: MATCHMAKING_ALGORITHM, mode, strengthGap: strengthGap ?? null, rest: { minimumRestMinutes, eligibleAt: new Date(now).toISOString() }, players: group.map((player) => ({ id: player.id, displayName: player.displayName, gamesPlayed: player.gamesPlayed, skillLevel: player.skillLevel, skillWeight: player.skillWeight, queueEnteredAt: player.queueEnteredAt?.toISOString() })), teamSkillTotals: { teamA: teamATotal, teamB: teamBTotal, difference: teamDifference }, skillDiversity: { groupSpread: skillSpread, partnerMix }, repeatPenalties: { recentPairCount: recentPairs.repeatedPairs, recentPairTotal: recentPairs.total, recentQuartetRepeats, allTimePairCount: allTimePairs.repeatedPairs, allTimePairTotal: allTimePairs.total, allTimeQuartetRepeats, recentPartnerRepeats, allTimePartnerRepeats }, partnerRotation: { recentRepeats: recentPartnerRepeats, allTimeRepeats: allTimePartnerRepeats, preservedTeamBalance: true }, lateArrival: { minimumPending, selectedPending: group.filter((player) => player.latePenaltyState === "PENDING").length, preferenceApplied: minimumPending > 0 || group.some((player) => player.latePenaltyState === "PENDING") }, fairness: { minimumGames: candidateMinimumGames, minimumGamesCount: lowestGamesCount, manualOverride: hasManualOverride, previouslySkippedCount }, fallback: null } };
       if (!best || compareCandidateKey(key, best.key) < 0) best = { key, suggestion };
     }

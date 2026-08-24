@@ -4,7 +4,7 @@ import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/cl
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
-import { isProhibitedGeneratedGenderMatch, suggestMatch, validateBalancedLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
+import { isProhibitedGeneratedGenderMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
 
@@ -84,7 +84,7 @@ test("generated doubles reject a female-only team against a male-only team", () 
   const male = [player("m1", Gender.MALE, 2), player("m2", Gender.MALE, 2)];
   assert.equal(isProhibitedGeneratedGenderMatch(female, male), true);
   assert.equal(isProhibitedGeneratedGenderMatch([female[0]!, male[0]!], [female[1]!, male[1]!]), false);
-  assert.equal(validateBalancedLineup(female, male, 1), null);
+  assert.equal(validateBalancedLineup(female, male, 0), null);
   const result = suggestMatch([...female, ...male], MatchmakingMode.OPEN, history);
   assert.ok(result);
   assert.equal(isProhibitedGeneratedGenderMatch(result.teamA, result.teamB), false);
@@ -152,15 +152,15 @@ test("recent partner repeats outrank older all-time repeats", () => {
   assert.equal(result.teamB.some((item) => item.id === "a") && result.teamB.some((item) => item.id === "b"), false);
 });
 
-test("balanced mode keeps player and team strength gaps within one", () => {
+test("handicap mode requires an exact team strength difference", () => {
   const result = suggestMatch([
     player("a", Gender.MALE, 2),
     player("b", Gender.MALE, 2),
-    player("c", Gender.MALE, 3),
+    player("c", Gender.MALE, 2),
     player("d", Gender.MALE, 3),
   ], MatchmakingMode.BALANCED, history);
   assert.ok(result);
-  assert.ok(result.difference <= 1);
+  assert.equal(result.difference, 1);
   assert.ok(Math.max(...[...result.teamA, ...result.teamB].map((item) => item.skillWeight)) - Math.min(...[...result.teamA, ...result.teamB].map((item) => item.skillWeight)) <= 1);
 
   const boundary = suggestMatch([
@@ -173,17 +173,35 @@ test("balanced mode keeps player and team strength gaps within one", () => {
   assert.equal(boundary.difference, 1);
 });
 
-test("balanced +2/+3 variants and rest boundary are enforced", () => {
+test("handicap +2/+3 variants and rest boundary are enforced", () => {
   assert.equal(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 3), player("d", Gender.MALE, 3)], MatchmakingMode.BALANCED, history), null);
-  assert.ok(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 3), player("d", Gender.MALE, 3)], MatchmakingMode.BALANCED, history, [], { strengthGap: 2 }));
+  assert.equal(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 3), player("d", Gender.MALE, 3)], MatchmakingMode.BALANCED, history, [], { strengthGap: 2 }), null);
+  assert.ok(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 1), player("d", Gender.MALE, 3)], MatchmakingMode.BALANCED, history, [], { strengthGap: 2 }));
+  assert.equal(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 3), player("d", Gender.MALE, 3)], MatchmakingMode.BALANCED, history, [], { strengthGap: 3 }), null);
+  assert.ok(suggestMatch([player("a", Gender.MALE, 1), player("b", Gender.MALE, 1), player("c", Gender.MALE, 1), player("d", Gender.MALE, 4)], MatchmakingMode.BALANCED, history, [], { strengthGap: 3 }));
   const rested = ["a", "b", "c", "d"].map((id) => player(id, Gender.MALE, 2));
   rested[0]!.lastMatchEndedAt = new Date("2026-01-01T09:30:00Z");
   assert.equal(suggestMatch(rested, MatchmakingMode.OPEN, history, [], { minimumRestMinutes: 30, now: new Date("2026-01-01T09:29:59Z") }), null);
   assert.ok(suggestMatch(rested, MatchmakingMode.OPEN, history, [], { minimumRestMinutes: 30, now: new Date("2026-01-01T10:00:00Z") }));
 });
 
+test("handicap lineups keep the exact team total before partner rotation", () => {
+  const recentPartners = new Map<string, Map<string, number>>([
+    ["a", new Map([["d", 1]])],
+    ["b", new Map([["c", 1]])],
+  ]);
+  const result = suggestMatch([
+    player("a", Gender.MALE, 1),
+    player("b", Gender.MALE, 2),
+    player("c", Gender.MALE, 2),
+    player("d", Gender.MALE, 3),
+  ], MatchmakingMode.BALANCED, { partners: new Map(), opponents: new Map(), quartets: new Map(), recentPartners }, [], { strengthGap: 2 });
+  assert.ok(result);
+  assert.equal(result.difference, 2);
+});
+
 test("balanced suggestions prioritize players skipped by the previous lineup", () => {
-  const players = ["a", "b", "c", "d", "e", "f"].map((id) => player(id, Gender.MALE, 2));
+  const players = ["a", "b", "c", "d", "e", "f"].map((id, index) => player(id, Gender.MALE, index < 3 ? 1 : 2));
   const first = suggestMatch(players, MatchmakingMode.BALANCED, history);
   assert.ok(first);
   const firstIds = new Set([...first.teamA, ...first.teamB].map((item) => item.id));
@@ -197,7 +215,7 @@ test("balanced suggestions prioritize players skipped by the previous lineup", (
 });
 
 test("pending late penalties disable skipped-player priority for balanced suggestions", () => {
-  const players = ["a", "b", "c", "d", "e", "f"].map((id) => player(id, Gender.MALE, 2));
+  const players = ["a", "b", "c", "d", "e", "f"].map((id, index) => player(id, Gender.MALE, index < 3 ? 1 : 2));
   players[5]!.latePenaltyState = "PENDING";
   const result = suggestMatch(players, MatchmakingMode.BALANCED, history, ["a,b|c,d"]);
   assert.ok(result);
@@ -238,7 +256,7 @@ test("balanced eligibility is evaluated before late penalties and exclusions", (
   const result = suggestMatch(players, MatchmakingMode.BALANCED, history);
   assert.ok(result);
   assert.equal([...result.teamA, ...result.teamB].some((item) => item.id === "e"), true);
-  assert.ok(result.difference <= 1);
+  assert.equal(result.difference, 1);
   assert.equal(suggestMatch([
     player("a", Gender.MALE, 2),
     player("b", Gender.MALE, 2),
@@ -307,4 +325,11 @@ test("history frequent-player ties resolve by display name", () => {
     ["a", { queuePlayerId: "a", displayName: "Amy", count: 2 }],
   ]));
   assert.equal(result?.displayName, "Amy");
+});
+
+test("undefeated challenge qualification uses the wins-first top-three order", () => {
+  const players = ["a", "b", "c", "d"].map((id, index) => ({ ...player(id, Gender.MALE, 2), gamesPlayed: index === 0 ? 3 : 4, wins: index === 2 ? 3 : index === 0 ? 3 : 4, losses: index === 2 ? 1 : 0 }));
+  assert.deepEqual(undefeatedChallengePlayers(players).map(({ player: value }) => value.id), ["b", "d"]);
+  const suggestion = suggestMatch(players.map((value) => ({ ...value, gamesPlayed: value.id === "a" ? 4 : value.gamesPlayed, wins: value.id === "a" ? 4 : value.wins })), MatchmakingMode.UNDEFEATED_CHALLENGE, history);
+  assert.ok(suggestion);
 });
