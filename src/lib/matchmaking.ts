@@ -21,7 +21,7 @@ export type MatchmakingOptions = { strengthGap?: 1 | 2 | 3; minimumRestMinutes?:
 export type Suggestion = { mode: MatchmakingMode; teamA: MatchPlayer[]; teamB: MatchPlayer[]; teamATotal: number; teamBTotal: number; difference: number; key: string; explanation: Record<string, unknown> };
 
 const DEFAULT_BALANCED_STRENGTH_GAP = 1;
-const MATCHMAKING_ALGORITHM = "v3-rest-strength";
+export const MATCHMAKING_ALGORITHM = "v4-upper-beginner-strict-balance";
 const count = (map: PairMap | undefined, a: string, b: string) => map?.get(a)?.get(b) ?? 0;
 const symmetricCount = (map: PairMap | undefined, a: string, b: string) => Math.max(count(map, a, b), count(map, b, a));
 const quartetKey = (players: MatchPlayer[]) => players.map((player) => player.id).sort().join(":");
@@ -43,6 +43,20 @@ function partnerCount(history: MatchHistory, a: string, b: string, recent: boole
 function pairStats(history: MatchHistory, players: MatchPlayer[], recent: boolean) { const values: number[] = []; for (let left = 0; left < players.length; left += 1) for (let right = left + 1; right < players.length; right += 1) values.push(encounterCount(history, players[left]!.id, players[right]!.id, recent)); return { repeatedPairs: values.filter((value) => value > 0).length, total: values.reduce((sum, value) => sum + value, 0) }; }
 function partnerRepeats(history: MatchHistory, team: MatchPlayer[], recent: boolean) { return partnerCount(history, team[0]!.id, team[1]!.id, recent); }
 function skillMix(team: MatchPlayer[]) { return Math.abs(team[0]!.skillWeight - team[1]!.skillWeight); }
+export const isProhibitedGeneratedGenderMatch = (teamA: MatchPlayer[], teamB: MatchPlayer[]) =>
+  teamA.length === 2 && teamB.length === 2
+  && ((teamA.every((player) => player.gender === Gender.FEMALE) && teamB.every((player) => player.gender === Gender.MALE))
+    || (teamA.every((player) => player.gender === Gender.MALE) && teamB.every((player) => player.gender === Gender.FEMALE)));
+
+export const validateBalancedLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[], strengthGap: number) => {
+  const group = [...teamA, ...teamB];
+  if (![1, 2].includes(teamA.length) || teamA.length !== teamB.length || new Set(group.map((player) => player.id)).size !== group.length) return "Choose unique players with equal team sizes for singles or doubles.";
+  const spread = Math.max(...group.map((player) => player.skillWeight)) - Math.min(...group.map((player) => player.skillWeight));
+  if (spread > strengthGap) return `Balanced matchups require all player strengths to be within ${strengthGap}.`;
+  const teamDifference = Math.abs(teamA.reduce((sum, player) => sum + player.skillWeight, 0) - teamB.reduce((sum, player) => sum + player.skillWeight, 0));
+  if (teamDifference > strengthGap) return `Balanced matchups require team strength totals to be within ${strengthGap}.`;
+  return null;
+};
 
 export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, history: MatchHistory, excludedKeys: string[] = [], options: MatchmakingOptions = {}): Suggestion | null {
   const now = (options.now ?? new Date()).getTime();
@@ -75,6 +89,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
     const sortedPlayers = [...group].sort((a, b) => a.id.localeCompare(b.id));
     for (const [teamA, teamB] of partitions(sortedPlayers)) {
       if (mode === MatchmakingMode.MIXED_DOUBLES && (new Set(teamA.map((player) => player.gender)).size !== 2 || new Set(teamB.map((player) => player.gender)).size !== 2)) continue;
+      if (isProhibitedGeneratedGenderMatch(teamA, teamB)) continue;
       const teamATotal = teamA.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamBTotal = teamB.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamDifference = Math.abs(teamATotal - teamBTotal);
@@ -89,7 +104,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
       const times = sortedTimes(group);
       const previouslySkippedCount = group.filter((player) => previouslySkippedPlayerIds.has(player.id)).length;
       const pendingCount = group.filter((player) => player.latePenaltyState === "PENDING").length;
-      const key: (number[] | number | string)[] = [priority, -lowestGamesCount, games[3]! - games[0]!, pendingCount, recentPairs.repeatedPairs, recentPairs.total, recentQuartetRepeats, allTimePairs.repeatedPairs, allTimePairs.total, allTimeQuartetRepeats, -previouslySkippedCount, mode === MatchmakingMode.BALANCED ? -skillSpread : mode === MatchmakingMode.SAME_SKILL ? skillSpread : 0, games, times, sortedPlayers.map((player) => player.id).join(","), teamDifference, recentPartnerRepeats, allTimePartnerRepeats, mode === MatchmakingMode.BALANCED ? -partnerMix : 0, keyString];
+      const key: (number[] | number | string)[] = [priority, -lowestGamesCount, games[3]! - games[0]!, pendingCount, recentPairs.repeatedPairs, recentPairs.total, recentQuartetRepeats, allTimePairs.repeatedPairs, allTimePairs.total, allTimeQuartetRepeats, -previouslySkippedCount, mode === MatchmakingMode.BALANCED ? -skillSpread : mode === MatchmakingMode.SAME_SKILL ? skillSpread : 0, games, times, recentPartnerRepeats, allTimePartnerRepeats, mode === MatchmakingMode.BALANCED ? -partnerMix : 0, teamDifference, sortedPlayers.map((player) => player.id).join(","), keyString];
       const suggestion: Suggestion = { mode, teamA, teamB, teamATotal, teamBTotal, difference: teamDifference, key: keyString, explanation: { algorithmVersion: MATCHMAKING_ALGORITHM, mode, strengthGap: strengthGap ?? null, rest: { minimumRestMinutes, eligibleAt: new Date(now).toISOString() }, players: group.map((player) => ({ id: player.id, displayName: player.displayName, gamesPlayed: player.gamesPlayed, skillLevel: player.skillLevel, skillWeight: player.skillWeight, queueEnteredAt: player.queueEnteredAt?.toISOString() })), teamSkillTotals: { teamA: teamATotal, teamB: teamBTotal, difference: teamDifference }, skillDiversity: { groupSpread: skillSpread, partnerMix }, repeatPenalties: { recentPairCount: recentPairs.repeatedPairs, recentPairTotal: recentPairs.total, recentQuartetRepeats, allTimePairCount: allTimePairs.repeatedPairs, allTimePairTotal: allTimePairs.total, allTimeQuartetRepeats, recentPartnerRepeats, allTimePartnerRepeats }, partnerRotation: { recentRepeats: recentPartnerRepeats, allTimeRepeats: allTimePartnerRepeats, preservedTeamBalance: true }, lateArrival: { minimumPending, selectedPending: group.filter((player) => player.latePenaltyState === "PENDING").length, preferenceApplied: minimumPending > 0 || group.some((player) => player.latePenaltyState === "PENDING") }, fairness: { minimumGames: candidateMinimumGames, minimumGamesCount: lowestGamesCount, manualOverride: hasManualOverride, previouslySkippedCount }, fallback: null } };
       if (!best || compareCandidateKey(key, best.key) < 0) best = { key, suggestion };
     }

@@ -1,3 +1,5 @@
+import { skillWeight, type SkillLevel } from "@shuttle-queue/domain";
+
 export function stalePlayerFilter(playerIds: string[]) {
   return playerIds.length ? { id: { notIn: playerIds } } : {};
 }
@@ -19,11 +21,17 @@ export function normalizeQueuePlayerSnapshotFields(snapshot: unknown): unknown {
     settings: value.settings && typeof value.settings === "object" && !Array.isArray(value.settings)
       ? { ...(value.settings as Record<string, unknown>), lateArrivalGraceMinutes: (value.settings as Record<string, unknown>).lateArrivalGraceMinutes ?? 10 }
       : value.settings,
+    players: Array.isArray(value.players) ? value.players.map((player) => {
+      if (!player || typeof player !== "object" || Array.isArray(player)) return player;
+      const profile = player as Record<string, unknown>;
+      return { ...profile, skillWeight: typeof profile.skillLevel === "string" ? skillWeight(profile.skillLevel as SkillLevel) : profile.skillWeight };
+    }) : value.players,
     queuePlayers: value.queuePlayers.map((player) => {
       if (!player || typeof player !== "object" || Array.isArray(player)) return player;
       const queuePlayer = player as Record<string, unknown>;
       return {
         ...queuePlayer,
+        skillWeight: typeof queuePlayer.skillLevel === "string" ? skillWeight(queuePlayer.skillLevel as SkillLevel) : queuePlayer.skillWeight,
         queueEnteredAt: queuePlayer.queueEnteredAt === undefined ? null : queuePlayer.queueEnteredAt,
         lastMatchEndedAt: queuePlayer.lastMatchEndedAt === undefined ? null : queuePlayer.lastMatchEndedAt,
         amountDueMinor: queuePlayer.amountDueMinor === undefined ? 0 : queuePlayer.amountDueMinor,

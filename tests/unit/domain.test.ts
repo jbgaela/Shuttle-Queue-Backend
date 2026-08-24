@@ -4,7 +4,7 @@ import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/cl
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
-import { suggestMatch, type MatchPlayer } from "../../src/lib/matchmaking.js";
+import { isProhibitedGeneratedGenderMatch, suggestMatch, validateBalancedLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
 
@@ -77,6 +77,17 @@ test("mixed doubles suggestion returns two players per gendered team", () => {
   assert.equal(result.teamA.length, 2);
   assert.equal(new Set(result.teamA.map((item) => item.gender)).size, 2);
   assert.equal(new Set(result.teamB.map((item) => item.gender)).size, 2);
+});
+
+test("generated doubles reject a female-only team against a male-only team", () => {
+  const female = [player("f1", Gender.FEMALE, 2), player("f2", Gender.FEMALE, 2)];
+  const male = [player("m1", Gender.MALE, 2), player("m2", Gender.MALE, 2)];
+  assert.equal(isProhibitedGeneratedGenderMatch(female, male), true);
+  assert.equal(isProhibitedGeneratedGenderMatch([female[0]!, male[0]!], [female[1]!, male[1]!]), false);
+  assert.equal(validateBalancedLineup(female, male, 1), null);
+  const result = suggestMatch([...female, ...male], MatchmakingMode.OPEN, history);
+  assert.ok(result);
+  assert.equal(isProhibitedGeneratedGenderMatch(result.teamA, result.teamB), false);
 });
 
 test("late penalties are minimized before existing fairness rules", () => {

@@ -25,6 +25,7 @@ enum Gender {
 enum SkillLevel {
   NEWBIE
   BEGINNER
+  UPPER_BEGINNER
   INTERMEDIATE
   UPPER_INTERMEDIATE
   ADVANCED
@@ -166,7 +167,7 @@ model QueueWorkspace {
   startedAt              DateTime    @default(now())
   endedAt                DateTime?
   lateArrivalCutoffAt    DateTime?
-  matchmakingAlgorithm   String      @default("v3-rest-strength")
+  matchmakingAlgorithm   String      @default("v4-upper-beginner-strict-balance")
   matchmakingRevision    Int         @default(1)
   createdAt              DateTime    @default(now())
   updatedAt              DateTime    @updatedAt
