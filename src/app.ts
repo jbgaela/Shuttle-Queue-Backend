@@ -40,6 +40,7 @@ const clockTimeSchema = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/);
 const courtNameSchema = z.string().transform((value) => normalizeText(value)).pipe(z.string().min(1).max(60));
 const playerNameSchema = z.string().transform((value) => normalizeText(value)).pipe(z.string().min(1).max(80));
 const PLAYER_NAME_CONFLICT_MESSAGE = "A player with this name has already been created or is already in the current queue.";
+const SESSION_PLAYER_NOT_REMOVABLE_MESSAGE = "Only inactive or checked-out players without match or payment history can be removed from this session.";
 const cloudSnapshotSchema = z.strictObject({
   schemaVersion: z.literal(2),
   queueMasterId: z.string().min(1),
@@ -429,6 +430,30 @@ api.post("/players/delete", requireAuth, requireMutationOrigin, route(async (req
 
 api.get("/queue/players", requireAuth, route(async (request, response) => { await ensureWorkspace(authUser(request).id); responseData(response, (await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id }, orderBy: [{ status: "asc" }, { queueEnteredAt: "asc" }] })).map(queuePlayerView)); }));
 api.post("/queue/players", requireAuth, requireMutationOrigin, route(async (request, response) => { const body = parse(z.object({ playerIds: z.array(idSchema).min(1).max(100) }), request.body); const ids = [...new Set(body.playerIds)]; const roster = await db.player.findMany({ where: { id: { in: ids }, queueMasterId: authUser(request).id, status: PlayerStatus.ACTIVE } }); if (roster.length !== ids.length) throw conflict("PLAYER_INELIGIBLE", "Every selected player must be active and owned by you."); const existing = await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id, playerId: { in: ids } } }); if (existing.length) throw conflict("PLAYER_ALREADY_IN_QUEUE", "One or more players are already in the queue."); const rows = await db.$transaction((tx: any) => Promise.all(roster.map((player: any) => tx.queuePlayer.create({ data: { queueMasterId: authUser(request).id, playerId: player.id, displayNameSnapshot: player.displayName, normalizedNameSnapshot: player.normalizedName, genderSnapshot: player.gender, skillLevelSnapshot: player.skillLevel, skillWeightSnapshot: skillWeight(player.skillLevel as SkillLevel) } })))); responseData(response, rows.map(queuePlayerView), 201); }));
+api.delete("/queue/players/:id", requireAuth, requireMutationOrigin, route(async (request, response) => {
+  const queueMasterId = authUser(request).id;
+  await activeWorkspaceFor(request);
+  await withTransactionRetry(async (tx: any) => {
+    const player = await tx.queuePlayer.findFirst({ where: { id: String(request.params.id), queueMasterId } });
+    if (!player) throw notFound("Queue player not found.");
+    if (![QueuePlayerStatus.INACTIVE, QueuePlayerStatus.CHECKED_OUT].includes(player.status)) throw conflict("SESSION_PLAYER_NOT_REMOVABLE", SESSION_PLAYER_NOT_REMOVABLE_MESSAGE);
+    const [participantCount, paymentCount] = await Promise.all([
+      tx.matchParticipant.count({ where: { queuePlayerId: player.id } }),
+      tx.payment.count({ where: { queuePlayerId: player.id } }),
+    ]);
+    if (participantCount > 0 || paymentCount > 0) throw conflict("SESSION_PLAYER_NOT_REMOVABLE", SESSION_PLAYER_NOT_REMOVABLE_MESSAGE);
+    await tx.queuePlayer.delete({ where: { id: player.id } });
+    const configRecord = await tx.queueFeeConfig.findUnique({ where: { queueMasterId } });
+    if (configRecord?.mode === FeeMode.EQUAL_SPLIT) {
+      const checkedIn = await tx.queuePlayer.findMany({ where: { queueMasterId, checkedInAt: { not: null } }, select: { id: true } });
+      const allocations = allocateEqualSplit(configRecord.expectedQueueCostMinor ?? 0, checkedIn.map((item: any) => item.id));
+      await Promise.all(checkedIn.map((item: any) => tx.queuePlayer.update({ where: { id: item.id }, data: { amountDueMinor: allocations.get(item.id) ?? 0, version: { increment: 1 } } })));
+    }
+    await tx.queueWorkspace.update({ where: { queueMasterId }, data: { matchmakingRevision: { increment: 1 }, version: { increment: 1 } } });
+    await audit(tx, request, { action: "SESSION_PLAYER_REMOVED", entityType: "QUEUE_PLAYER", entityId: player.id, reason: "Removed from active session", before: player });
+  });
+  noContent(response);
+}));
 api.post("/queue/players/bulk-action", requireAuth, requireMutationOrigin, route(async (request, response) => {
   const body = parse(z.object({ playerIds: z.array(idSchema).min(1).max(100), action: z.enum(["CHECK_IN", "REST", "CHECK_OUT"]) }), request.body);
   const ids = [...new Set(body.playerIds)];
