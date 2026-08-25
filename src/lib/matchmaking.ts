@@ -24,7 +24,7 @@ export type MatchmakingOptions = { strengthGap?: 1 | 2 | 3; minimumRestMinutes?:
 export type Suggestion = { mode: MatchmakingMode; teamA: MatchPlayer[]; teamB: MatchPlayer[]; teamATotal: number; teamBTotal: number; difference: number; key: string; explanation: Record<string, unknown> };
 
 const DEFAULT_BALANCED_STRENGTH_GAP = 1;
-export const MATCHMAKING_ALGORITHM = "v6-lone-female-priority";
+export const MATCHMAKING_ALGORITHM = "v7-newbie-partner-policy";
 const isQualifiedLoneFemaleGroup = (group: MatchPlayer[]) => group.length === 4 && group.filter((player) => player.gender === Gender.FEMALE).length === 1 && group.filter((player) => player.gender === Gender.MALE).length === 3 && group.some((player) => player.gender === Gender.FEMALE && LONE_FEMALE_SKILL_LEVELS.some((level) => level === player.skillLevel));
 export const loneFemalePolicy = (teamA: MatchPlayer[], teamB: MatchPlayer[], mixedDoublesFallback = false) => { const group = [...teamA, ...teamB]; const qualifyingFemale = isQualifiedLoneFemaleGroup(group) ? group.find((player) => player.gender === Gender.FEMALE) : undefined; return { eligibleSkillLevels: ["INTERMEDIATE", "UPPER_INTERMEDIATE", "ADVANCED"], qualifyingFemaleId: qualifyingFemale?.id ?? null, applied: Boolean(qualifyingFemale), mixedDoublesFallback: Boolean(qualifyingFemale && mixedDoublesFallback) }; };
 const count = (map: PairMap | undefined, a: string, b: string) => map?.get(a)?.get(b) ?? 0;
@@ -75,6 +75,17 @@ export const isProhibitedGeneratedGenderMatch = (teamA: MatchPlayer[], teamB: Ma
   && ((teamA.every((player) => player.gender === Gender.FEMALE) && teamB.every((player) => player.gender === Gender.MALE))
     || (teamA.every((player) => player.gender === Gender.MALE) && teamB.every((player) => player.gender === Gender.FEMALE)));
 
+const isAllowedNewbiePartner = (player: MatchPlayer) => player.skillLevel === "BEGINNER" || player.skillLevel === "UPPER_BEGINNER";
+export const isProhibitedGeneratedNewbieMatch = (teamA: MatchPlayer[], teamB: MatchPlayer[]) => {
+  if (teamA.length !== 2 || teamB.length !== 2) return false;
+  return [teamA, teamB].some((team) => team.some((player) => {
+    if (player.skillLevel !== "NEWBIE") return false;
+    const partner = team.find((candidate) => candidate.id !== player.id);
+    return !partner || !isAllowedNewbiePartner(partner);
+  }));
+};
+const hasNewbieCompatiblePartition = (group: MatchPlayer[]) => partitions(group).some(([teamA, teamB]) => !isProhibitedGeneratedNewbieMatch(teamA, teamB));
+
 export const validateBalancedLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[], strengthGap: number) => {
   const group = [...teamA, ...teamB];
   if (![1, 2].includes(teamA.length) || teamA.length !== teamB.length || new Set(group.map((player) => player.id)).size !== group.length) return "Choose unique players with equal team sizes for singles or doubles.";
@@ -95,7 +106,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
   const excluded = new Set(excludedKeys);
   const previousSuggestionPlayerIds = new Set(excludedKeys.length > 0 && !eligible.some((player) => player.latePenaltyState === "PENDING") ? excludedKeys[excludedKeys.length - 1]!.split(/[|,]/).filter(Boolean) : []);
   const previouslySkippedPlayerIds = new Set(previousSuggestionPlayerIds.size > 0 ? eligible.filter((player) => !previousSuggestionPlayerIds.has(player.id)).map((player) => player.id) : []);
-  const validGroup = (group: MatchPlayer[]) => { const genders = new Set(group.map((player) => player.gender)); const qualifiedLoneFemale = isQualifiedLoneFemaleGroup(group); if (mode === MatchmakingMode.SAME_GENDER && genders.size !== 1) return false; if (mode === MatchmakingMode.MIXED_DOUBLES && !((genders.size === 2 && group.filter((player) => player.gender === Gender.MALE).length === 2) || qualifiedLoneFemale)) return false; if (mode === MatchmakingMode.SAME_SKILL && new Set(group.map((player) => player.skillWeight)).size !== 1) return false; return mode !== MatchmakingMode.BALANCED || Math.max(...group.map((player) => player.skillWeight)) - Math.min(...group.map((player) => player.skillWeight)) <= strengthGap!; };
+  const validGroup = (group: MatchPlayer[]) => { const genders = new Set(group.map((player) => player.gender)); const qualifiedLoneFemale = isQualifiedLoneFemaleGroup(group); if (mode === MatchmakingMode.SAME_GENDER && genders.size !== 1) return false; if (mode === MatchmakingMode.MIXED_DOUBLES && !((genders.size === 2 && group.filter((player) => player.gender === Gender.MALE).length === 2) || qualifiedLoneFemale)) return false; if (mode === MatchmakingMode.SAME_SKILL && new Set(group.map((player) => player.skillWeight)).size !== 1) return false; if (!hasNewbieCompatiblePartition(group)) return false; return mode !== MatchmakingMode.BALANCED || Math.max(...group.map((player) => player.skillWeight)) - Math.min(...group.map((player) => player.skillWeight)) <= strengthGap!; };
   let candidateMinimumGames = Number.POSITIVE_INFINITY;
   forEachCombination(eligible, 4, (group) => { if (validGroup(group)) candidateMinimumGames = Math.min(candidateMinimumGames, ...group.map((player) => player.gamesPlayed)); });
   if (!Number.isFinite(candidateMinimumGames)) return null;
@@ -119,7 +130,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
       const qualifiedLoneFemale = isQualifiedLoneFemaleGroup(group);
       const standardMixedDoubles = new Set(teamA.map((player) => player.gender)).size === 2 && new Set(teamB.map((player) => player.gender)).size === 2;
       if (mode === MatchmakingMode.MIXED_DOUBLES && !standardMixedDoubles && !qualifiedLoneFemale) continue;
-      if (isProhibitedGeneratedGenderMatch(teamA, teamB)) continue;
+      if (isProhibitedGeneratedGenderMatch(teamA, teamB) || isProhibitedGeneratedNewbieMatch(teamA, teamB)) continue;
       const teamATotal = teamA.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamBTotal = teamB.reduce((sum, player) => sum + player.skillWeight, 0);
       const teamDifference = Math.abs(teamATotal - teamBTotal);

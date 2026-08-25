@@ -4,7 +4,7 @@ import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/cl
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
-import { isProhibitedGeneratedGenderMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
+import { isProhibitedGeneratedGenderMatch, isProhibitedGeneratedNewbieMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
 
@@ -103,6 +103,19 @@ test("generated doubles reject a female-only team against a male-only team", () 
   const result = suggestMatch([...female, ...male], MatchmakingMode.OPEN, history);
   assert.ok(result);
   assert.equal(isProhibitedGeneratedGenderMatch(result.teamA, result.teamB), false);
+});
+
+test("generated matches require Newbies to partner with Beginner or Upper Beginner", () => {
+  const make = (id: string, skillLevel: MatchPlayer["skillLevel"], skillWeight: number): MatchPlayer => ({ ...player(id, Gender.MALE, skillWeight), skillLevel });
+  assert.equal(suggestMatch([make("n1", "NEWBIE", 1), make("n2", "NEWBIE", 1), make("n3", "NEWBIE", 1), make("n4", "NEWBIE", 1)], MatchmakingMode.OPEN, history), null);
+  assert.equal(suggestMatch([make("n1", "NEWBIE", 1), make("n2", "NEWBIE", 1), make("n3", "NEWBIE", 1), make("n4", "NEWBIE", 1)], MatchmakingMode.SAME_SKILL, history), null);
+  assert.equal(suggestMatch([make("n1", "NEWBIE", 1), make("n2", "NEWBIE", 1), make("n3", "NEWBIE", 1), make("b1", "BEGINNER", 2)], MatchmakingMode.OPEN, history), null);
+  const valid = suggestMatch([make("n1", "NEWBIE", 1), make("n2", "NEWBIE", 1), make("b1", "BEGINNER", 2), make("u1", "UPPER_BEGINNER", 3)], MatchmakingMode.OPEN, history);
+  assert.ok(valid);
+  assert.equal(isProhibitedGeneratedNewbieMatch(valid.teamA, valid.teamB), false);
+  assert.equal(suggestMatch([make("n1", "NEWBIE", 1), make("i1", "INTERMEDIATE", 4), make("i2", "INTERMEDIATE", 4), make("i3", "INTERMEDIATE", 4)], MatchmakingMode.OPEN, history), null);
+  const undefeated = ["n1", "n2", "n3", "n4"].map((id) => ({ ...make(id, "NEWBIE", 1), gamesPlayed: 4, wins: 4 }));
+  assert.equal(suggestMatch(undefeated, MatchmakingMode.UNDEFEATED_CHALLENGE, history), null);
 });
 
 test("late penalties are minimized before existing fairness rules", () => {
