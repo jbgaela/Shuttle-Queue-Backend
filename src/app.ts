@@ -16,7 +16,7 @@ import { normalizeName, normalizeText, normalizeUsername } from "./lib/normalize
 import { skillWeight } from "./lib/skills.js";
 import { allocateEqualSplit, collectionTotalsByPlayer } from "./lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "./lib/queue-actions.js";
-import { isProhibitedGeneratedGenderMatch, MATCHMAKING_ALGORITHM, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, type MatchHistory, type MatchPlayer, type MatchmakingOptions } from "./lib/matchmaking.js";
+import { isProhibitedGeneratedGenderMatch, loneFemalePolicy, MATCHMAKING_ALGORITHM, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, type MatchHistory, type MatchPlayer, type MatchmakingOptions } from "./lib/matchmaking.js";
 import { validateScores, type ScoreInput } from "./lib/score.js";
 import { normalizeQueuePlayerSnapshotFields } from "./lib/sync-snapshot.js";
 import { persistSyncSnapshot, type SyncUpload } from "./lib/sync-persistence.js";
@@ -500,6 +500,7 @@ async function createMatch(request: Request, body: { teamA: string[]; teamB: str
   const manualQueue = !body.suggestionToken && !body.courtId;
   const settings = (await ensureWorkspace(queueMasterId)).settings;
   const matchId = await withTransactionRetry(async (tx) => {
+    let generatedLoneFemalePolicy: ReturnType<typeof loneFemalePolicy> | null = null;
     if (body.suggestionPayload) {
       const workspace = await tx.queueWorkspace.findUnique({ where: { queueMasterId }, select: { matchmakingRevision: true } });
       if (!workspace || workspace.matchmakingRevision !== Number(body.suggestionPayload.revision)) throw conflict("SUGGESTION_STALE", "Generate a new suggestion.");
@@ -516,6 +517,7 @@ async function createMatch(request: Request, body: { teamA: string[]; teamB: str
       };
       const teamAPlayers = body.teamA.map(toMatchPlayer);
       const teamBPlayers = body.teamB.map(toMatchPlayer);
+      generatedLoneFemalePolicy = loneFemalePolicy(teamAPlayers, teamBPlayers, body.suggestionPayload.mode === MatchmakingMode.MIXED_DOUBLES);
       if (isProhibitedGeneratedGenderMatch(teamAPlayers, teamBPlayers)) throw conflict("GENERATED_GENDER_RULE", "Generated matchups cannot place two female players against two male players.");
       if (body.suggestionPayload.mode === MatchmakingMode.BALANCED) {
         const strengthGap = Number(body.suggestionPayload.strengthGap ?? 1);
@@ -530,7 +532,7 @@ async function createMatch(request: Request, body: { teamA: string[]; teamB: str
     const challengeAdjusted = body.suggestionPayload?.mode === MatchmakingMode.UNDEFEATED_CHALLENGE && Boolean(body.suggestionAdjusted);
     const persistedMode = challengeAdjusted ? null : body.suggestionPayload?.mode as MatchmakingMode | undefined ?? null;
     const persistedAlgorithm = body.suggestionToken && !challengeAdjusted ? MATCHMAKING_ALGORITHM : null;
-    const suggestionExplanation = body.suggestionPayload ? { algorithmVersion: persistedAlgorithm, strengthGap: body.suggestionPayload.strengthGap ?? null, mode: persistedMode, originalMode: body.suggestionPayload.mode ?? null, challengeRelabeled: challengeAdjusted, adjusted: Boolean(body.suggestionAdjusted), generatedGenderRule: "NO_TWO_FEMALE_VS_TWO_MALE", rest: { minimumRestMinutes: settings.minimumRestMinutes } } : null;
+    const suggestionExplanation = body.suggestionPayload ? { algorithmVersion: persistedAlgorithm, strengthGap: body.suggestionPayload.strengthGap ?? null, mode: persistedMode, originalMode: body.suggestionPayload.mode ?? null, challengeRelabeled: challengeAdjusted, adjusted: Boolean(body.suggestionAdjusted), generatedGenderRule: "NO_TWO_FEMALE_VS_TWO_MALE", loneFemalePolicy: generatedLoneFemalePolicy, rest: { minimumRestMinutes: settings.minimumRestMinutes } } : null;
     const created = await tx.match.create({ data: { queueMasterId, courtId: court?.id ?? null, courtIdSnapshot: court?.id ?? null, courtNameSnapshot: court?.name ?? null, status, source, matchmakingMode: persistedMode, algorithmVersion: persistedAlgorithm, suggestionKey: challengeAdjusted ? null : typeof body.suggestionPayload?.key === "string" ? body.suggestionPayload.key : null, suggestionExplanation, pointsToWin: settings.pointsToWin, winBy: settings.winBy, scoreCap: settings.scoreCap, bestOf: settings.bestOf, startedAt: court ? new Date() : null, participants: { create: all.map((id) => ({ queuePlayerId: id, priorQueueEnteredAt: players.find((player: any) => player.id === id)?.queueEnteredAt ?? null, team: body.teamA.includes(id) ? TeamSide.A : TeamSide.B, teamSlot: body.teamA.includes(id) ? body.teamA.indexOf(id) + 1 : body.teamB.indexOf(id) + 1 })) } } });
     if (court) {
       const claimedCourt = await tx.court.updateMany({ where: { id: court.id, status: CourtStatus.AVAILABLE, OR: [{ currentMatchId: null }, { currentMatchId: { isSet: false } }] }, data: { status: CourtStatus.OCCUPIED, currentMatchId: created.id, version: { increment: 1 } } });
