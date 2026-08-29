@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
-import { normalizeName } from "./normalize.js";
+import { PRIZE_RANKING_METHOD, rankRecords } from "./prize-ranking.js";
 
-export const PUBLIC_RANKING_SNAPSHOT_VERSION = 2;
+export const PUBLIC_RANKING_SNAPSHOT_VERSION = 3;
 export const PUBLIC_RANKING_MATCH_LIMIT = 1000;
 
 export type PublicRankingRow = {
-  rank: number;
+  rank: number | null;
   playerKey: string;
   player: string;
   matchesPlayed: number;
@@ -16,6 +16,12 @@ export type PublicRankingRow = {
   pointsFor: number;
   pointsAgainst: number;
   pointDifferential: number;
+  eligible: boolean;
+  gamesNeeded: number;
+  rankingScoreBasisPoints: number | null;
+  pointPercentageBasisPoints: number | null;
+  isPrizePosition: boolean;
+  seededDrawUsed: boolean;
 };
 
 export type PublicRankingMatch = {
@@ -32,6 +38,7 @@ export type PublicRankingSnapshot = {
   firstMatchStartedAt?: string | null;
   rankings: PublicRankingRow[];
   matches: PublicRankingMatch[];
+  rankingMethod: typeof PRIZE_RANKING_METHOD;
 };
 
 type RankingPlayer = {
@@ -67,9 +74,9 @@ function publicMatchKey(publicationId: string, matchId: string) {
   return publicKey(publicationId, matchId);
 }
 
-function publicRankingRow(row: RankingPlayer, index: number, publicationId: string): PublicRankingRow {
+function publicRankingRow(row: RankingPlayer & { rank?: number | null; eligible?: boolean; gamesNeeded?: number; rankingScoreBasisPoints?: number | null; pointPercentageBasisPoints?: number | null; isPrizePosition?: boolean; seededDrawUsed?: boolean }, publicationId: string): PublicRankingRow {
   return {
-    rank: index + 1,
+    rank: row.rank ?? null,
     playerKey: publicPlayerKey(publicationId, row.id),
     player: row.displayNameSnapshot,
     matchesPlayed: row.matchesPlayed,
@@ -79,6 +86,12 @@ function publicRankingRow(row: RankingPlayer, index: number, publicationId: stri
     pointsFor: row.pointsFor,
     pointsAgainst: row.pointsAgainst,
     pointDifferential: row.pointsFor - row.pointsAgainst,
+    eligible: row.eligible ?? false,
+    gamesNeeded: row.gamesNeeded ?? 0,
+    rankingScoreBasisPoints: row.rankingScoreBasisPoints ?? null,
+    pointPercentageBasisPoints: row.pointPercentageBasisPoints ?? null,
+    isPrizePosition: row.isPrizePosition ?? false,
+    seededDrawUsed: row.seededDrawUsed ?? false,
   };
 }
 
@@ -108,17 +121,19 @@ export function publicMatchFromRecord(match: any, publicationId: string): Public
   };
 }
 
-export function publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches, firstMatchStartedAt }: { publicationId: string; capturedAt: Date; rows: any[]; matches: any[]; firstMatchStartedAt?: Date | string | null }): PublicRankingSnapshot {
+export function publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches, firstMatchStartedAt, sessionStartedAt }: { publicationId: string; capturedAt: Date; rows: any[]; matches: any[]; firstMatchStartedAt?: Date | string | null; sessionStartedAt?: Date | string | null }): PublicRankingSnapshot {
+  const rankedRows = rankRecords(rows.map((row) => ({ ...row, displayName: row.displayName ?? row.displayNameSnapshot ?? row.player ?? "" })), sessionStartedAt ?? firstMatchStartedAt ?? capturedAt);
   return {
     schemaVersion: PUBLIC_RANKING_SNAPSHOT_VERSION,
     capturedAt: capturedAt.toISOString(),
     firstMatchStartedAt: firstMatchStartedAt === undefined ? earliestMatchStartedAt(matches) : earliestMatchStartedAt([{ startedAt: firstMatchStartedAt }]),
-    rankings: rows.map((row, index) => publicRankingRow(row, index, publicationId)),
+    rankings: rankedRows.map((row) => publicRankingRow({ ...row, displayNameSnapshot: row.displayName }, publicationId)),
     matches: matches
       .map((match) => publicMatchFromRecord(match, publicationId))
       .filter((match): match is PublicRankingMatch => Boolean(match))
       .sort((left, right) => (right.completedAt ?? "").localeCompare(left.completedAt ?? "") || left.matchKey.localeCompare(right.matchKey))
       .slice(0, PUBLIC_RANKING_MATCH_LIMIT),
+    rankingMethod: PRIZE_RANKING_METHOD,
   };
 }
 
@@ -135,14 +150,19 @@ export function publicRankingSnapshotFromCloudSnapshot(snapshot: CloudSnapshotV2
   return publicRankingSnapshotFromRecords({
     publicationId,
     capturedAt,
-    rows: [...snapshot.queuePlayers].sort((left, right) => right.wins - left.wins || right.matchesPlayed - left.matchesPlayed || normalizeName(left.displayName).localeCompare(normalizeName(right.displayName))).map((player) => ({ ...player, displayNameSnapshot: player.displayName })),
+    rows: snapshot.queuePlayers.map((player) => ({ ...player, displayNameSnapshot: player.displayName })),
+    sessionStartedAt: snapshot.workspace?.startedAt ?? capturedAt.toISOString(),
     firstMatchStartedAt: earliestMatchStartedAt(allMatches),
     matches: allMatches.filter((match) => match.status === "COMPLETED").map((match) => cloudMatchRecord(match, names)),
   });
 }
 
 export function isPublicRankingSnapshot(value: unknown): value is PublicRankingSnapshot {
-  return Boolean(value && typeof value === "object" && (value as { schemaVersion?: unknown }).schemaVersion === PUBLIC_RANKING_SNAPSHOT_VERSION && Array.isArray((value as { rankings?: unknown }).rankings) && Array.isArray((value as { matches?: unknown }).matches));
+  return Boolean(value && typeof value === "object" && [2, PUBLIC_RANKING_SNAPSHOT_VERSION].includes((value as { schemaVersion?: unknown }).schemaVersion as number) && Array.isArray((value as { rankings?: unknown }).rankings) && Array.isArray((value as { matches?: unknown }).matches));
+}
+
+export function recalculatePublicRankingRows(rows: Array<Record<string, any>>, sessionStartedAt: Date | string) {
+  return rankRecords(rows.map((row) => ({ id: String(row.playerKey ?? row.id ?? row.player), displayName: String(row.player ?? row.displayName ?? ""), matchesPlayed: Number(row.matchesPlayed) || 0, wins: Number(row.wins) || 0, losses: Number(row.losses) || 0, pointsFor: Number(row.pointsFor) || 0, pointsAgainst: Number(row.pointsAgainst) || 0 })), sessionStartedAt).map((row) => ({ rank: row.rank, playerKey: rows.find((candidate) => String(candidate.playerKey ?? candidate.id ?? candidate.player) === row.id)?.playerKey ?? row.id, player: row.displayName, matchesPlayed: row.matchesPlayed, wins: row.wins, losses: row.losses, winRateBasisPoints: row.matchesPlayed ? Math.floor((row.wins * 10000) / row.matchesPlayed) : 0, pointsFor: row.pointsFor, pointsAgainst: row.pointsAgainst, pointDifferential: row.pointsFor - row.pointsAgainst, eligible: row.eligible, gamesNeeded: row.gamesNeeded, rankingScoreBasisPoints: row.rankingScoreBasisPoints, pointPercentageBasisPoints: row.pointPercentageBasisPoints, isPrizePosition: row.isPrizePosition, seededDrawUsed: row.seededDrawUsed }));
 }
 
 export function publicHistoryFromSnapshot(snapshot: PublicRankingSnapshot, playerKey: string) {

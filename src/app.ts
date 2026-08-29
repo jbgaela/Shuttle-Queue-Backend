@@ -23,7 +23,8 @@ import { persistSyncSnapshot, type SyncUpload } from "./lib/sync-persistence.js"
 import { clearLoginFailures, clearSessionCookie, currentCsrfToken, issueSession, passwordHash, recordLoginFailure, requireAuth, requireMutationOrigin, requireSuperAdmin, rotateSession, throttleLogin, verifyPassword, type AuthenticatedRequest } from "./lib/auth.js";
 import { auditLogData, type AuditValues } from "./lib/audit.js";
 import { datePartsForInstant, inclusiveMinuteCutoff } from "./lib/timezone.js";
-import { activePublicRankingWhere, isPublicRankingSnapshot, publicHistoryFromSnapshot, publicMatchFromRecord, publicPlayerKey, publicRankingSnapshotFromRecords, PUBLIC_RANKING_MATCH_LIMIT } from "./lib/public-rankings.js";
+import { activePublicRankingWhere, isPublicRankingSnapshot, publicHistoryFromSnapshot, publicMatchFromRecord, publicPlayerKey, publicRankingSnapshotFromRecords, recalculatePublicRankingRows, PUBLIC_RANKING_MATCH_LIMIT } from "./lib/public-rankings.js";
+import { PRIZE_RANKING_METHOD, rankRecords, rankingStats } from "./lib/prize-ranking.js";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 
 const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "password", "passwordHash"] });
@@ -640,19 +641,25 @@ api.post("/matches/:id/complete", requireAuth, requireMutationOrigin, route(asyn
 api.post("/matches", requireAuth, requireMutationOrigin, route(async (request, response) => { const body = parse(z.object({ teamA: z.array(idSchema), teamB: z.array(idSchema), courtId: idSchema.optional(), suggestionToken: z.string().min(20).optional(), suggestionAdjusted: z.boolean().optional() }), request.body); const suggestionPayload = body.suggestionToken ? await validateSuggestionRequest(request, body.suggestionToken, body.teamA, body.teamB, Boolean(body.suggestionAdjusted)) : undefined; responseData(response, matchView(await createMatch(request, { ...body, suggestionPayload })), 201); }));
 api.get("/matches", requireAuth, route(async (request, response) => { const matches = await db.match.findMany({ where: { queueMasterId: authUser(request).id, status: { in: [MatchStatus.QUEUED, MatchStatus.IN_PROGRESS] } }, orderBy: [{ queuedAt: "asc" }, { id: "asc" }], include: { participants: { include: { queuePlayer: true } }, court: true } }); responseData(response, matches.map(matchView)); }));
 api.post("/matches/start-suggestion", requireAuth, requireMutationOrigin, route(async (request, response) => { const body = parse(z.object({ teamA: z.array(idSchema).length(2), teamB: z.array(idSchema).length(2), courtId: idSchema, suggestionToken: z.string().min(20) }), request.body); const suggestionPayload = await validateSuggestionRequest(request, body.suggestionToken, body.teamA, body.teamB, false); responseData(response, matchView(await createMatch(request, { ...body, suggestionToken: body.suggestionToken, suggestionPayload })), 201); }));
-function rankingRow(row: any, index: number) {
-  return { rank: index + 1, queuePlayerId: row.id, player: row.displayNameSnapshot, playerId: row.playerId, gender: row.genderSnapshot, skillLevel: row.skillLevelSnapshot, matchesPlayed: row.matchesPlayed, wins: row.wins, losses: row.losses, winRateBasisPoints: row.matchesPlayed ? Math.floor((row.wins * 10000) / row.matchesPlayed) : 0, pointsFor: row.pointsFor, pointsAgainst: row.pointsAgainst, pointDifferential: row.pointsFor - row.pointsAgainst };
+function rankingRow(row: any) {
+  const stats = rankingStats(row);
+  return { rank: row.rank ?? null, queuePlayerId: row.id, sessionPlayerId: row.id, player: row.displayNameSnapshot, playerId: row.playerId, gender: row.genderSnapshot, skillLevel: row.skillLevelSnapshot, matchesPlayed: row.matchesPlayed, wins: row.wins, losses: row.losses, ...stats, pointsFor: row.pointsFor, pointsAgainst: row.pointsAgainst, eligible: row.eligible ?? false, gamesNeeded: row.gamesNeeded ?? 0, rankingScoreBasisPoints: row.rankingScoreBasisPoints ?? null, pointPercentageBasisPoints: row.pointPercentageBasisPoints ?? null, isPrizePosition: row.isPrizePosition ?? false, seededDrawUsed: row.seededDrawUsed ?? false };
 }
 async function rankingRows(queueMasterId: string, database = db) {
-  return database.queuePlayer.findMany({ where: { queueMasterId }, orderBy: [{ wins: "desc" }, { matchesPlayed: "desc" }, { normalizedNameSnapshot: "asc" }, { id: "asc" }] });
+  const [rows, workspace] = await Promise.all([
+    database.queuePlayer.findMany({ where: { queueMasterId } }),
+    database.queueWorkspace.findUnique({ where: { queueMasterId }, select: { startedAt: true } }),
+  ]);
+  return rankRecords(rows.map((row: any) => ({ ...row, displayName: row.displayNameSnapshot })), workspace?.startedAt ?? new Date(0));
 }
 async function publicRankingSnapshot(queueMasterId: string, publicationId: string, capturedAt = new Date(), database = db) {
-  const [rows, matches, firstStartedMatch] = await Promise.all([
+  const [rows, matches, firstStartedMatch, workspace] = await Promise.all([
     rankingRows(queueMasterId, database),
     database.match.findMany({ where: { queueMasterId, status: MatchStatus.COMPLETED }, include: { participants: { include: { queuePlayer: true } }, scoreRevisions: { include: { games: true } } }, orderBy: { completedAt: "desc" }, take: PUBLIC_RANKING_MATCH_LIMIT }),
     database.match.findFirst({ where: { queueMasterId, startedAt: { not: null } }, orderBy: [{ startedAt: "asc" }, { id: "asc" }], select: { startedAt: true } }),
+    database.queueWorkspace.findUnique({ where: { queueMasterId }, select: { startedAt: true } }),
   ]);
-  return publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches, firstMatchStartedAt: firstStartedMatch?.startedAt ?? null });
+  return publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches, firstMatchStartedAt: firstStartedMatch?.startedAt ?? null, sessionStartedAt: workspace?.startedAt ?? null });
 }
 function publicPublicationState(publication: any) {
   return publication.revokedAt || !publication.enabled ? "REVOKED" : publication.finalizedAt ? "FINAL" : "LIVE";
@@ -668,7 +675,7 @@ async function finalizePublicRankingPublication(tx: any, queueMasterId: string, 
   await tx.auditLog.create({ data: { queueMasterId, action: "PUBLIC_RANKINGS_FINALIZED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Public rankings finalized with the session", afterJson: { sessionEndedAt: endedAt.toISOString() }, requestId: `system:public-ranking:${endedAt.getTime()}` } });
   return finalized;
 }
-api.get("/rankings", requireAuth, route(async (request, response) => { const rows = await rankingRows(authUser(request).id); responseData(response, rows.map(rankingRow)); }));
+api.get("/rankings", requireAuth, route(async (request, response) => { const rows = await rankingRows(authUser(request).id); responseData(response, { rankingMethod: PRIZE_RANKING_METHOD, rankings: rows.map(rankingRow) }); }));
 api.get("/workspace/public-rankings", requireAuth, route(async (request, response) => {
   const queueMasterId = authUser(request).id;
   const workspace = await workspaceFor(request);
@@ -723,7 +730,7 @@ api.get("/public/rankings/:token", rateLimit({ windowMs: 60_000, limit: 120, sta
     if (!publication.finalSnapshot || typeof publication.finalSnapshot !== "object") throw notFound("Public rankings are not available.");
     const snapshot = publication.finalSnapshot as { capturedAt: string; firstMatchStartedAt?: string | null; rankings: unknown[]; matches?: unknown[]; schemaVersion?: number };
     const historyAvailable = isPublicRankingSnapshot(snapshot);
-    responseData(response, { sessionStartedAt: publication.sessionStartedAt, firstMatchStartedAt: historyAvailable ? snapshot.firstMatchStartedAt ?? null : null, sessionEndedAt: publication.sessionEndedAt, state: "FINAL", serverTime: new Date().toISOString(), lastUpdatedAt: snapshot.capturedAt, historyAvailable, rankings: snapshot.rankings });
+    responseData(response, { sessionStartedAt: publication.sessionStartedAt, firstMatchStartedAt: historyAvailable ? snapshot.firstMatchStartedAt ?? null : null, sessionEndedAt: publication.sessionEndedAt, state: "FINAL", serverTime: new Date().toISOString(), lastUpdatedAt: snapshot.capturedAt, historyAvailable, rankingMethod: PRIZE_RANKING_METHOD, rankings: Array.isArray(snapshot.rankings) ? recalculatePublicRankingRows(snapshot.rankings as Array<Record<string, any>>, publication.sessionStartedAt) : snapshot.rankings });
     return;
   }
   const workspace = await db.queueWorkspace.findUnique({ where: { queueMasterId: publication.queueMasterId } });
@@ -733,7 +740,7 @@ api.get("/public/rankings/:token", rateLimit({ windowMs: 60_000, limit: 120, sta
     db.match.findFirst({ where: { queueMasterId: publication.queueMasterId, startedAt: { not: null } }, orderBy: [{ startedAt: "asc" }, { id: "asc" }], select: { startedAt: true } }),
   ]);
   const updatedAt = rows.reduce((latest: Date, row: any) => row.updatedAt > latest ? row.updatedAt : latest, workspace.updatedAt);
-  responseData(response, { sessionStartedAt: publication.sessionStartedAt, firstMatchStartedAt: firstStartedMatch?.startedAt?.toISOString() ?? null, sessionEndedAt: workspace.endedAt, state: workspace.endedAt ? "FINAL" : "LIVE", serverTime: new Date().toISOString(), lastUpdatedAt: updatedAt, historyAvailable: true, rankings: rows.map((row: any, index: number) => ({ rank: index + 1, playerKey: publicPlayerKey(publication.id, row.id), player: row.displayNameSnapshot, matchesPlayed: row.matchesPlayed, wins: row.wins, losses: row.losses, winRateBasisPoints: row.matchesPlayed ? Math.floor((row.wins * 10000) / row.matchesPlayed) : 0, pointsFor: row.pointsFor, pointsAgainst: row.pointsAgainst, pointDifferential: row.pointsFor - row.pointsAgainst })) });
+  responseData(response, { sessionStartedAt: publication.sessionStartedAt, firstMatchStartedAt: firstStartedMatch?.startedAt?.toISOString() ?? null, sessionEndedAt: workspace.endedAt, state: workspace.endedAt ? "FINAL" : "LIVE", serverTime: new Date().toISOString(), lastUpdatedAt: updatedAt, historyAvailable: true, rankingMethod: PRIZE_RANKING_METHOD, rankings: rows.map((row: any) => { const value = rankingRow(row); return { rank: value.rank, playerKey: publicPlayerKey(publication.id, row.id), player: value.player, matchesPlayed: value.matchesPlayed, wins: value.wins, losses: value.losses, winRateBasisPoints: value.winRateBasisPoints, pointsFor: value.pointsFor, pointsAgainst: value.pointsAgainst, pointDifferential: value.pointDifferential, eligible: value.eligible, gamesNeeded: value.gamesNeeded, rankingScoreBasisPoints: value.rankingScoreBasisPoints, pointPercentageBasisPoints: value.pointPercentageBasisPoints, isPrizePosition: value.isPrizePosition, seededDrawUsed: value.seededDrawUsed }; }) });
 }));
 api.get("/public/rankings/:token/players/:playerKey/history", rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: "draft-8", legacyHeaders: false }), route(async (request, response) => {
   const tokenValue = String(request.params.token);
@@ -837,7 +844,7 @@ api.post("/workspace/end", requireAuth, requireMutationOrigin, route(async (requ
 api.patch("/matches/:id", requireAuth, requireMutationOrigin, route(async (request, response) => {
   const queueMasterId = authUser(request).id;
   await activeWorkspaceFor(request);
-  const body = parse(z.object({ teamA: z.array(idSchema).min(1).max(2), teamB: z.array(idSchema).min(1).max(2), courtId: idSchema.optional() }), request.body);
+  const body = parse(z.object({ teamA: z.array(idSchema).min(1).max(2), teamB: z.array(idSchema).min(1).max(2), courtId: idSchema.optional(), swapWithMatchId: idSchema.optional() }), request.body);
   if (body.teamA.length !== body.teamB.length || new Set([...body.teamA, ...body.teamB]).size !== body.teamA.length + body.teamB.length) throw badRequest("Choose unique players with equal team sizes for singles or doubles.");
   const expected = versionFrom(request);
   const settings = (await ensureWorkspace(queueMasterId)).settings;
@@ -866,13 +873,31 @@ api.patch("/matches/:id", requireAuth, requireMutationOrigin, route(async (reque
       const balanceError = validateBalancedLineup(teamAPlayers, teamBPlayers, Number((match.suggestionExplanation as any)?.strengthGap ?? 1));
       if (balanceError) throw conflict("BALANCE_CONSTRAINT_VIOLATION", balanceError);
     }
+    if (body.swapWithMatchId !== undefined && body.courtId === undefined) throw badRequest("A target court is required for a court swap.");
+    if (body.swapWithMatchId !== undefined && body.courtId === match.courtId) throw badRequest("Choose a different target court for a court swap.");
     let targetCourt: any = null;
+    let swappedMatch: any = null;
+    let currentCourt: any = null;
     if (match.status === MatchStatus.IN_PROGRESS && body.courtId !== undefined && body.courtId !== match.courtId) {
-      targetCourt = await tx.court.findFirst({ where: { id: body.courtId, queueMasterId, status: CourtStatus.AVAILABLE, OR: [{ currentMatchId: null }, { currentMatchId: { isSet: false } }] } });
+      targetCourt = await tx.court.findFirst({ where: { id: body.courtId, queueMasterId } });
       if (!targetCourt) throw conflict("COURT_NOT_AVAILABLE", "The selected court is no longer available.");
-      const claimedCourt = await tx.court.updateMany({ where: { id: targetCourt.id, queueMasterId, status: CourtStatus.AVAILABLE, OR: [{ currentMatchId: null }, { currentMatchId: { isSet: false } }] }, data: { status: CourtStatus.OCCUPIED, currentMatchId: match.id, version: { increment: 1 } } });
-      if (claimedCourt.count !== 1) throw conflict("COURT_NOT_AVAILABLE", "The selected court is no longer available.");
-      if (match.courtId) await tx.court.updateMany({ where: { id: match.courtId, currentMatchId: match.id }, data: { status: CourtStatus.AVAILABLE, currentMatchId: null, version: { increment: 1 } } });
+      if (targetCourt.status === CourtStatus.AVAILABLE && !targetCourt.currentMatchId) {
+        if (body.swapWithMatchId !== undefined) throw conflict("COURT_SWAP_STALE", "The selected court is no longer occupied. Refresh the live courts and try again.");
+        const claimedCourt = await tx.court.updateMany({ where: { id: targetCourt.id, queueMasterId, status: CourtStatus.AVAILABLE, OR: [{ currentMatchId: null }, { currentMatchId: { isSet: false } }] }, data: { status: CourtStatus.OCCUPIED, currentMatchId: match.id, version: { increment: 1 } } });
+        if (claimedCourt.count !== 1) throw conflict("COURT_NOT_AVAILABLE", "The selected court is no longer available.");
+        if (match.courtId) await tx.court.updateMany({ where: { id: match.courtId, currentMatchId: match.id }, data: { status: CourtStatus.AVAILABLE, currentMatchId: null, version: { increment: 1 } } });
+      } else {
+        if (!body.swapWithMatchId) throw conflict("COURT_SWAP_REQUIRED", "The selected court is occupied. Confirm a court swap to continue.");
+        currentCourt = match.courtId ? await tx.court.findFirst({ where: { id: match.courtId, queueMasterId } }) : null;
+        if (!currentCourt || currentCourt.status !== CourtStatus.OCCUPIED || currentCourt.currentMatchId !== match.id || targetCourt.status !== CourtStatus.OCCUPIED || targetCourt.currentMatchId !== body.swapWithMatchId) throw conflict("COURT_SWAP_STALE", "The selected court assignments changed. Refresh the live courts and try again.");
+        swappedMatch = await tx.match.findFirst({ where: { id: body.swapWithMatchId, queueMasterId, status: MatchStatus.IN_PROGRESS, courtId: targetCourt.id } });
+        if (!swappedMatch || swappedMatch.id === match.id) throw conflict("COURT_SWAP_STALE", "The selected court assignments changed. Refresh the live courts and try again.");
+        const sourceCourtUpdated = await tx.court.updateMany({ where: { id: currentCourt.id, queueMasterId, status: CourtStatus.OCCUPIED, currentMatchId: match.id }, data: { currentMatchId: swappedMatch.id, version: { increment: 1 } } });
+        const targetCourtUpdated = await tx.court.updateMany({ where: { id: targetCourt.id, queueMasterId, status: CourtStatus.OCCUPIED, currentMatchId: swappedMatch.id }, data: { currentMatchId: match.id, version: { increment: 1 } } });
+        if (sourceCourtUpdated.count !== 1 || targetCourtUpdated.count !== 1) throw conflict("COURT_SWAP_STALE", "The selected court assignments changed. Refresh the live courts and try again.");
+        const swappedMatchUpdated = await tx.match.updateMany({ where: { id: swappedMatch.id, queueMasterId, status: MatchStatus.IN_PROGRESS, courtId: targetCourt.id, version: swappedMatch.version }, data: { courtId: currentCourt.id, courtIdSnapshot: currentCourt.id, courtNameSnapshot: currentCourt.name, source: MatchSource.MANUAL_ADJUSTED, suggestionKey: null, suggestionExplanation: { ...(swappedMatch.suggestionExplanation as any ?? {}), adjusted: true }, version: { increment: 1 } } });
+        if (swappedMatchUpdated.count !== 1) throw conflict("COURT_SWAP_STALE", "The selected match changed. Refresh the live courts and try again.");
+      }
     }
     const priorById = new Map(match.participants.map((participant: any) => [participant.queuePlayerId, participant.priorQueueEnteredAt]));
     await tx.matchParticipant.deleteMany({ where: { matchId: match.id } });
@@ -882,8 +907,9 @@ api.patch("/matches/:id", requireAuth, requireMutationOrigin, route(async (reque
     const preservedBalanced = match.matchmakingMode === MatchmakingMode.BALANCED;
     const courtData = targetCourt ? { courtId: targetCourt.id, courtIdSnapshot: targetCourt.id, courtNameSnapshot: targetCourt.name } : {};
     await tx.match.update({ where: { id: match.id, version: expected }, data: { ...courtData, source: MatchSource.MANUAL_ADJUSTED, matchmakingMode: preservedBalanced ? MatchmakingMode.BALANCED : null, algorithmVersion: preservedBalanced ? (match.algorithmVersion ?? MATCHMAKING_ALGORITHM) : null, suggestionKey: null, suggestionExplanation: preservedBalanced ? { ...(match.suggestionExplanation as any ?? {}), algorithmVersion: match.algorithmVersion ?? MATCHMAKING_ALGORITHM, adjusted: true } : null, version: { increment: 1 } } });
+    if (swappedMatch && currentCourt) await audit(tx, request, { action: "MATCH_UPDATED", entityType: "MATCH", entityId: swappedMatch.id, reason: "Live match court swapped by Queue Master", before: { courtId: swappedMatch.courtId }, after: { courtId: currentCourt.id, swappedWithMatchId: match.id } });
     await tx.queueWorkspace.update({ where: { queueMasterId }, data: { matchmakingRevision: { increment: 1 }, version: { increment: 1 } } });
-    await audit(tx, request, { action: "MATCH_UPDATED", entityType: "MATCH", entityId: match.id, reason: match.status === MatchStatus.IN_PROGRESS ? "Live match edited by Queue Master" : "Queued lineup edited by Queue Master", before: { participants: match.participants, courtId: match.courtId }, after: { teamA: body.teamA, teamB: body.teamB, courtId: targetCourt?.id ?? match.courtId } });
+    await audit(tx, request, { action: "MATCH_UPDATED", entityType: "MATCH", entityId: match.id, reason: match.status === MatchStatus.IN_PROGRESS ? "Live match edited by Queue Master" : "Queued lineup edited by Queue Master", before: { participants: match.participants, courtId: match.courtId }, after: { teamA: body.teamA, teamB: body.teamB, courtId: targetCourt?.id ?? match.courtId, swappedWithMatchId: swappedMatch?.id ?? null } });
     return match.id;
   });
   responseData(response, matchView(await db.match.findUnique({ where: { id: updatedId }, include: { participants: { include: { queuePlayer: true } }, court: true } })));
