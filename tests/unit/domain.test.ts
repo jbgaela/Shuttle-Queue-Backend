@@ -4,7 +4,7 @@ import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/cl
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
-import { isProhibitedGeneratedGenderMatch, isProhibitedGeneratedNewbieMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
+import { isProhibitedGeneratedGenderMatch, isProhibitedGeneratedNewbieMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, validateMixedDoublesLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
 
@@ -79,15 +79,10 @@ test("mixed doubles suggestion returns two players per gendered team", () => {
   assert.equal(new Set(result.teamB.map((item) => item.gender)).size, 2);
 });
 
-test("qualified lone-female mixed doubles fallback is preferred only when standard mixed is unavailable", () => {
+test("mixed doubles rejects a lone-female group regardless of skill", () => {
   const qualifiedFemale = { ...player("f", Gender.FEMALE, 4), skillLevel: "INTERMEDIATE" };
-  const fallback = suggestMatch([qualifiedFemale, player("m1", Gender.MALE, 1), player("m2", Gender.MALE, 2), player("m3", Gender.MALE, 3)], MatchmakingMode.MIXED_DOUBLES, history);
-  assert.ok(fallback);
-  assert.equal([...fallback.teamA, ...fallback.teamB].filter((item) => item.gender === Gender.FEMALE).length, 1);
-  const fallbackPolicy = fallback.explanation.loneFemalePolicy as { applied: boolean; qualifyingFemaleId: string | null; mixedDoublesFallback: boolean };
-  assert.equal(fallbackPolicy.applied, true);
-  assert.equal(fallbackPolicy.qualifyingFemaleId, "f");
-  assert.equal(fallbackPolicy.mixedDoublesFallback, true);
+  assert.equal(suggestMatch([qualifiedFemale, player("m1", Gender.MALE, 1), player("m2", Gender.MALE, 2), player("m3", Gender.MALE, 3)], MatchmakingMode.MIXED_DOUBLES, history), null);
+  assert.equal(suggestMatch([{ ...qualifiedFemale, skillLevel: "ADVANCED" }, player("m1", Gender.MALE, 1), player("m2", Gender.MALE, 2), player("m3", Gender.MALE, 3)], MatchmakingMode.MIXED_DOUBLES, history), null);
   assert.equal(suggestMatch([player("u", Gender.FEMALE, 3), player("m1", Gender.MALE, 1), player("m2", Gender.MALE, 2), player("m3", Gender.MALE, 3)], MatchmakingMode.MIXED_DOUBLES, history), null);
   const standard = suggestMatch([{ ...player("f1", Gender.FEMALE, 4), skillLevel: "INTERMEDIATE" }, { ...player("f2", Gender.FEMALE, 4), skillLevel: "INTERMEDIATE" }, player("m1", Gender.MALE, 1), player("m2", Gender.MALE, 2), player("m3", Gender.MALE, 3)], MatchmakingMode.MIXED_DOUBLES, history);
   assert.ok(standard);

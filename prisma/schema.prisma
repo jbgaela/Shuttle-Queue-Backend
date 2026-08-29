@@ -372,6 +372,7 @@ model Match {
   scoreRevisions       MatchScoreRevision[] @relation("MatchRevisions")
 
   @@index([queueMasterId, status, queuedAt])
+  @@index([queueMasterId, status, completedAt])
 }
 
 model MatchParticipant {
