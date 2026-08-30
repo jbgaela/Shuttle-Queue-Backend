@@ -3,7 +3,7 @@ import test from "node:test";
 import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/client";
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
-import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView } from "../../src/lib/history.js";
+import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView, playerHistoryStats } from "../../src/lib/history.js";
 import { isProhibitedGeneratedGenderMatch, isProhibitedGeneratedNewbieMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, validateMixedDoublesLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
@@ -348,6 +348,18 @@ test("history frequent-player ties resolve by display name", () => {
     ["a", { queuePlayerId: "a", displayName: "Amy", count: 2 }],
   ]));
   assert.equal(result?.displayName, "Amy");
+});
+
+test("player history stats average valid durations and count partners and opponents", () => {
+  const participant = (queuePlayerId: string, displayName: string, team: "A" | "B") => ({ queuePlayerId, team, queuePlayer: { displayNameSnapshot: displayName } });
+  const result = playerHistoryStats([
+    { startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:01:00.000Z", participants: [participant("p1", "Player", "A"), participant("p2", "Zoe", "A"), participant("p3", "Amy", "B")] },
+    { startedAt: "2026-01-01T01:00:00.000Z", completedAt: "2026-01-01T01:03:00.000Z", participants: [participant("p1", "Player", "B"), participant("p2", "Zoe", "A"), participant("p3", "Amy", "B")] },
+    { startedAt: null, completedAt: "2026-01-01T02:03:00.000Z", participants: [participant("p2", "Zoe", "A"), participant("p4", "Bea", "B")] },
+  ], "p1");
+  assert.equal(result.averageDurationSeconds, 120);
+  assert.deepEqual(result.mostPlayedPartner, { queuePlayerId: "p3", displayName: "Amy", count: 1 });
+  assert.deepEqual(result.mostPlayedOpponent, { queuePlayerId: "p3", displayName: "Amy", count: 1 });
 });
 
 test("undefeated challenge qualification uses the wins-first top-three order", () => {

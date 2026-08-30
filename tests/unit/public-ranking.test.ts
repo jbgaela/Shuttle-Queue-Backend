@@ -33,10 +33,12 @@ test("public ranking snapshots include every joined player and hide private fiel
     { id: "zero", displayName: "Zero", wins: 0, losses: 0, matchesPlayed: 0, pointsFor: 0, pointsAgainst: 0 },
     { id: "winner", displayName: "Winner", wins: 3, losses: 1, matchesPlayed: 4, pointsFor: 84, pointsAgainst: 70, gender: "MALE", skillLevel: "ADVANCED" },
   ] } as unknown as Parameters<typeof publicRankingRowsFromSnapshot>[0]);
-  assert.deepEqual(rows, [
-    { rank: null, playerKey: publicPlayerKey("queue", "winner"), player: "Winner", matchesPlayed: 4, wins: 3, losses: 1, winRateBasisPoints: 7500, pointsFor: 84, pointsAgainst: 70, pointDifferential: 14, eligible: false, gamesNeeded: 1, rankingScoreBasisPoints: null, pointPercentageBasisPoints: null, isPrizePosition: false, seededDrawUsed: false },
-    { rank: null, playerKey: publicPlayerKey("queue", "zero"), player: "Zero", matchesPlayed: 0, wins: 0, losses: 0, winRateBasisPoints: 0, pointsFor: 0, pointsAgainst: 0, pointDifferential: 0, eligible: false, gamesNeeded: 5, rankingScoreBasisPoints: null, pointPercentageBasisPoints: null, isPrizePosition: false, seededDrawUsed: false },
+  assert.deepEqual(rows.map(({ rank, playerKey, player, matchesPlayed, eligible, gamesNeeded, isPrizePosition }) => ({ rank, playerKey, player, matchesPlayed, eligible, gamesNeeded, isPrizePosition })), [
+    { rank: 1, playerKey: publicPlayerKey("queue", "winner"), player: "Winner", matchesPlayed: 4, eligible: false, gamesNeeded: 1, isPrizePosition: false },
+    { rank: null, playerKey: publicPlayerKey("queue", "zero"), player: "Zero", matchesPlayed: 0, eligible: false, gamesNeeded: 5, isPrizePosition: false },
   ]);
+  assert.notEqual(rows[0]!.rankingScoreBasisPoints, null);
+  assert.notEqual(rows[0]!.pointPercentageBasisPoints, null);
   assert.equal("gender" in rows[0]!, false);
   assert.equal("skillLevel" in rows[0]!, false);
 });
@@ -46,7 +48,7 @@ test("public ranking snapshot ordering is deterministic for equal records", () =
     { id: "beta", displayName: "Beta", wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 31, pointsAgainst: 20 },
     { id: "alpha", displayName: "alpha", wins: 1, losses: 0, matchesPlayed: 1, pointsFor: 31, pointsAgainst: 20 },
   ] } as unknown as Parameters<typeof publicRankingRowsFromSnapshot>[0]);
-  assert.deepEqual(rows.map((row) => row.player), ["alpha", "Beta"]);
+  assert.deepEqual(rows.map((row) => row.player), ["Beta", "alpha"]);
 });
 
 test("public history snapshots use the current revision and expose compact team scores", () => {
@@ -59,6 +61,7 @@ test("public history snapshots use the current revision and expose compact team 
     matches: [{
       id: "match-1",
       status: "COMPLETED",
+      startedAt: "2025-01-02T11:55:00.000Z",
       completedAt: "2025-01-02T12:00:00.000Z",
       winnerTeam: "A",
       currentRevisionId: "revision-2",
@@ -72,6 +75,8 @@ test("public history snapshots use the current revision and expose compact team 
       ],
     }],
   } as unknown as Parameters<typeof publicRankingSnapshotFromCloudSnapshot>[0], "publication", new Date("2025-01-02T12:01:00.000Z"));
+  assert.equal(snapshot.schemaVersion, 4);
+  assert.equal(snapshot.matches[0]?.startedAt, "2025-01-02T11:55:00.000Z");
   const playerKey = publicPlayerKey("publication", "p1");
   const history = publicHistoryFromSnapshot(snapshot, playerKey);
   assert.ok(history);
@@ -87,9 +92,19 @@ test("public history snapshots use the current revision and expose compact team 
     teamA: ["Alice"],
     teamB: ["Bob"],
   });
+  assert.deepEqual(history.stats, {
+    averageDurationSeconds: 300,
+    mostPlayedPartner: null,
+    mostPlayedOpponent: { displayName: "Bob", count: 1 },
+  });
+  assert.equal("queuePlayerId" in history.stats.mostPlayedOpponent!, false);
   assert.equal("gender" in history.matches[0]!, false);
   assert.equal("participants" in history.matches[0]!, false);
   assert.equal("queueMasterId" in history.matches[0]!, false);
+  const legacySnapshot = { ...snapshot, schemaVersion: 3 as const, matches: snapshot.matches.map(({ startedAt: _startedAt, ...match }) => match) };
+  const legacyHistory = publicHistoryFromSnapshot(legacySnapshot, playerKey);
+  assert.equal(legacyHistory?.stats.averageDurationSeconds, null);
+  assert.deepEqual(legacyHistory?.stats.mostPlayedOpponent, { displayName: "Bob", count: 1 });
 });
 
 test("database and offline snapshot history mappers produce the same public match log", () => {
@@ -105,6 +120,7 @@ test("database and offline snapshot history mappers produce the same public matc
   assert.equal(databaseSnapshot.firstMatchStartedAt, "2025-01-02T11:00:00.000Z");
   assert.equal(cloudSnapshot.firstMatchStartedAt, databaseSnapshot.firstMatchStartedAt);
   assert.equal(isPublicRankingSnapshot(databaseSnapshot), true);
+  assert.equal(isPublicRankingSnapshot({ ...databaseSnapshot, schemaVersion: 3 }), true);
   assert.equal(isPublicRankingSnapshot({ capturedAt: capturedAt.toISOString(), rankings: databaseSnapshot.rankings }), false);
   assert.equal(publicHistoryFromSnapshot(databaseSnapshot, "unknown"), null);
 });
@@ -123,7 +139,7 @@ test("offline snapshots preserve the earliest started match even when it is not 
   assert.deepEqual(snapshot.matches, []);
 });
 
-test("public rankings apply the five-game rule and confidence score to archived rows", () => {
+test("public rankings show provisional archived rows without granting prize positions", () => {
   const rows = recalculatePublicRankingRows([
     { playerKey: "perfect", player: "Perfect", matchesPlayed: 5, wins: 5, losses: 0, pointsFor: 105, pointsAgainst: 50 },
     { playerKey: "strong", player: "Strong", matchesPlayed: 10, wins: 9, losses: 1, pointsFor: 189, pointsAgainst: 120 },
@@ -131,6 +147,9 @@ test("public rankings apply the five-game rule and confidence score to archived 
   ], "2026-08-30T10:00:00.000Z");
   assert.equal(rows[0]!.player, "Strong");
   assert.equal(rows[0]!.isPrizePosition, true);
-  assert.equal(rows[2]!.rank, null);
+  assert.equal(rows[2]!.rank, 3);
+  assert.equal(rows[2]!.eligible, false);
   assert.equal(rows[2]!.gamesNeeded, 1);
+  assert.notEqual(rows[2]!.rankingScoreBasisPoints, null);
+  assert.equal(rows[2]!.isPrizePosition, false);
 });

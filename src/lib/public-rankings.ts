@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 import { PRIZE_RANKING_METHOD, rankRecords } from "./prize-ranking.js";
+import { historyDurationSeconds } from "./history.js";
 
-export const PUBLIC_RANKING_SNAPSHOT_VERSION = 3;
+export const PUBLIC_RANKING_SNAPSHOT_VERSION = 4;
 export const PUBLIC_RANKING_MATCH_LIMIT = 1000;
+const DEFAULT_RANKING_SESSION_STARTED_AT = new Date(0).toISOString();
 
 export type PublicRankingRow = {
   rank: number | null;
@@ -26,6 +28,7 @@ export type PublicRankingRow = {
 
 export type PublicRankingMatch = {
   matchKey: string;
+  startedAt?: string | null;
   completedAt: string | null;
   winnerTeam: "A" | "B" | null;
   participants: Array<{ playerKey: string; player: string; team: "A" | "B"; teamSlot: number }>;
@@ -33,12 +36,18 @@ export type PublicRankingMatch = {
 };
 
 export type PublicRankingSnapshot = {
-  schemaVersion: typeof PUBLIC_RANKING_SNAPSHOT_VERSION;
+  schemaVersion: 2 | 3 | typeof PUBLIC_RANKING_SNAPSHOT_VERSION;
   capturedAt: string;
   firstMatchStartedAt?: string | null;
   rankings: PublicRankingRow[];
   matches: PublicRankingMatch[];
   rankingMethod: typeof PRIZE_RANKING_METHOD;
+};
+
+export type PublicRankingPlayerHistoryStats = {
+  averageDurationSeconds: number | null;
+  mostPlayedPartner: { displayName: string; count: number } | null;
+  mostPlayedOpponent: { displayName: string; count: number } | null;
 };
 
 type RankingPlayer = {
@@ -104,6 +113,7 @@ export function publicMatchFromRecord(match: any, publicationId: string): Public
   const revision = currentRevision(match);
   return {
     matchKey: publicMatchKey(publicationId, String(match.id)),
+    startedAt: match.startedAt instanceof Date ? match.startedAt.toISOString() : match.startedAt ?? null,
     completedAt: match.completedAt instanceof Date ? match.completedAt.toISOString() : match.completedAt ?? null,
     winnerTeam: match.winnerTeam ?? revision?.winnerTeam ?? null,
     participants: (match.participants ?? []).map((participant: any) => ({
@@ -122,7 +132,7 @@ export function publicMatchFromRecord(match: any, publicationId: string): Public
 }
 
 export function publicRankingSnapshotFromRecords({ publicationId, capturedAt, rows, matches, firstMatchStartedAt, sessionStartedAt }: { publicationId: string; capturedAt: Date; rows: any[]; matches: any[]; firstMatchStartedAt?: Date | string | null; sessionStartedAt?: Date | string | null }): PublicRankingSnapshot {
-  const rankedRows = rankRecords(rows.map((row) => ({ ...row, displayName: row.displayName ?? row.displayNameSnapshot ?? row.player ?? "" })), sessionStartedAt ?? firstMatchStartedAt ?? capturedAt);
+  const rankedRows = rankRecords(rows.map((row) => ({ ...row, displayName: row.displayName ?? row.displayNameSnapshot ?? row.player ?? "" })), sessionStartedAt ?? firstMatchStartedAt ?? DEFAULT_RANKING_SESSION_STARTED_AT);
   return {
     schemaVersion: PUBLIC_RANKING_SNAPSHOT_VERSION,
     capturedAt: capturedAt.toISOString(),
@@ -151,35 +161,71 @@ export function publicRankingSnapshotFromCloudSnapshot(snapshot: CloudSnapshotV2
     publicationId,
     capturedAt,
     rows: snapshot.queuePlayers.map((player) => ({ ...player, displayNameSnapshot: player.displayName })),
-    sessionStartedAt: snapshot.workspace?.startedAt ?? capturedAt.toISOString(),
+    sessionStartedAt: snapshot.workspace?.startedAt,
     firstMatchStartedAt: earliestMatchStartedAt(allMatches),
     matches: allMatches.filter((match) => match.status === "COMPLETED").map((match) => cloudMatchRecord(match, names)),
   });
 }
 
 export function isPublicRankingSnapshot(value: unknown): value is PublicRankingSnapshot {
-  return Boolean(value && typeof value === "object" && [2, PUBLIC_RANKING_SNAPSHOT_VERSION].includes((value as { schemaVersion?: unknown }).schemaVersion as number) && Array.isArray((value as { rankings?: unknown }).rankings) && Array.isArray((value as { matches?: unknown }).matches));
+  return Boolean(value && typeof value === "object" && [2, 3, PUBLIC_RANKING_SNAPSHOT_VERSION].includes((value as { schemaVersion?: unknown }).schemaVersion as number) && Array.isArray((value as { rankings?: unknown }).rankings) && Array.isArray((value as { matches?: unknown }).matches));
 }
 
 export function recalculatePublicRankingRows(rows: Array<Record<string, any>>, sessionStartedAt: Date | string) {
   return rankRecords(rows.map((row) => ({ id: String(row.playerKey ?? row.id ?? row.player), displayName: String(row.player ?? row.displayName ?? ""), matchesPlayed: Number(row.matchesPlayed) || 0, wins: Number(row.wins) || 0, losses: Number(row.losses) || 0, pointsFor: Number(row.pointsFor) || 0, pointsAgainst: Number(row.pointsAgainst) || 0 })), sessionStartedAt).map((row) => ({ rank: row.rank, playerKey: rows.find((candidate) => String(candidate.playerKey ?? candidate.id ?? candidate.player) === row.id)?.playerKey ?? row.id, player: row.displayName, matchesPlayed: row.matchesPlayed, wins: row.wins, losses: row.losses, winRateBasisPoints: row.matchesPlayed ? Math.floor((row.wins * 10000) / row.matchesPlayed) : 0, pointsFor: row.pointsFor, pointsAgainst: row.pointsAgainst, pointDifferential: row.pointsFor - row.pointsAgainst, eligible: row.eligible, gamesNeeded: row.gamesNeeded, rankingScoreBasisPoints: row.rankingScoreBasisPoints, pointPercentageBasisPoints: row.pointPercentageBasisPoints, isPrizePosition: row.isPrizePosition, seededDrawUsed: row.seededDrawUsed }));
 }
 
+function publicHistoryStats(matches: PublicRankingMatch[], playerKey: string): PublicRankingPlayerHistoryStats {
+  const durations: number[] = [];
+  const partners = new Map<string, { displayName: string; count: number }>();
+  const opponents = new Map<string, { displayName: string; count: number }>();
+  const increment = (counts: Map<string, { displayName: string; count: number }>, participant: PublicRankingMatch["participants"][number]) => {
+    const current = counts.get(participant.playerKey);
+    counts.set(participant.playerKey, { displayName: participant.player, count: (current?.count ?? 0) + 1 });
+  };
+  for (const match of matches) {
+    const selected = match.participants.find((participant) => participant.playerKey === playerKey);
+    if (!selected) continue;
+    const duration = historyDurationSeconds(match);
+    if (duration !== null && Number.isFinite(duration)) durations.push(duration);
+    for (const participant of match.participants) {
+      if (participant.playerKey === playerKey) continue;
+      increment(participant.team === selected.team ? partners : opponents, participant);
+    }
+  }
+  const choose = (counts: Map<string, { displayName: string; count: number }>) => [...counts.entries()].sort((left, right) => right[1].count - left[1].count || left[1].displayName.localeCompare(right[1].displayName) || left[0].localeCompare(right[0]))[0]?.[1] ?? null;
+  return {
+    averageDurationSeconds: durations.length ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length) : null,
+    mostPlayedPartner: choose(partners),
+    mostPlayedOpponent: choose(opponents),
+  };
+}
+
+function publicHistoryMatch(match: PublicRankingMatch, playerKey: string) {
+  return {
+    matchKey: match.matchKey,
+    completedAt: match.completedAt,
+    winnerTeam: match.winnerTeam,
+    result: match.winnerTeam && match.participants.some((participant) => participant.playerKey === playerKey && participant.team === match.winnerTeam) ? "WIN" : "LOSS",
+    teamA: match.participants.filter((participant) => participant.team === "A").sort((left, right) => left.teamSlot - right.teamSlot).map((participant) => participant.player),
+    teamB: match.participants.filter((participant) => participant.team === "B").sort((left, right) => left.teamSlot - right.teamSlot).map((participant) => participant.player),
+    games: match.games,
+  };
+}
+
+export function publicHistoryFromMatches(player: { playerKey: string; player: string }, matches: PublicRankingMatch[]) {
+  const playerMatches = matches.filter((match) => match.participants.some((participant) => participant.playerKey === player.playerKey));
+  return {
+    player,
+    stats: publicHistoryStats(playerMatches, player.playerKey),
+    matches: playerMatches.map((match) => publicHistoryMatch(match, player.playerKey)),
+  };
+}
+
 export function publicHistoryFromSnapshot(snapshot: PublicRankingSnapshot, playerKey: string) {
   const player = snapshot.rankings.find((row) => row.playerKey === playerKey);
   if (!player) return null;
-  return {
-    player: { playerKey, player: player.player },
-    matches: snapshot.matches.filter((match) => match.participants.some((participant) => participant.playerKey === playerKey)).map((match) => ({
-      matchKey: match.matchKey,
-      completedAt: match.completedAt,
-      winnerTeam: match.winnerTeam,
-      result: match.winnerTeam && match.participants.some((participant) => participant.playerKey === playerKey && participant.team === match.winnerTeam) ? "WIN" : "LOSS",
-      teamA: match.participants.filter((participant) => participant.team === "A").sort((left, right) => left.teamSlot - right.teamSlot).map((participant) => participant.player),
-      teamB: match.participants.filter((participant) => participant.team === "B").sort((left, right) => left.teamSlot - right.teamSlot).map((participant) => participant.player),
-      games: match.games,
-    })),
-  };
+  return publicHistoryFromMatches({ playerKey, player: player.player }, snapshot.matches);
 }
 
 export function activePublicRankingWhere() {

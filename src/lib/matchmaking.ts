@@ -1,5 +1,5 @@
 import { Gender, MatchmakingMode, QueuePlayerStatus } from "@prisma/client";
-import { MATCHMAKING_ALGORITHM, LONE_FEMALE_SKILL_LEVELS, isMixedDoublesGroup as isDomainMixedDoublesGroup, isStandardMixedDoublesLineup as isDomainStandardMixedDoublesLineup, suggestMatch as suggestDomainMatch, undefeatedChallengePlayers as domainUndefeatedChallengePlayers, validateMixedDoublesLineup as validateDomainMixedDoublesLineup, validateSynergyLineup as validateDomainSynergyLineup, type DomainSynergyTeam, type MatchHistory as DomainMatchHistory, type MatchPlayer as DomainMatchPlayer, type MatchmakingMode as DomainMatchmakingMode } from "@shuttle-queue/domain";
+import { MATCHMAKING_ALGORITHM, LONE_FEMALE_SKILL_LEVELS, lowSkillLoneFemaleAdvisory as domainLowSkillLoneFemaleAdvisory, isMixedDoublesGroup as isDomainMixedDoublesGroup, isStandardMixedDoublesLineup as isDomainStandardMixedDoublesLineup, suggestMatch as suggestDomainMatch, undefeatedChallengePlayers as domainUndefeatedChallengePlayers, validateMixedDoublesLineup as validateDomainMixedDoublesLineup, validateSynergyLineup as validateDomainSynergyLineup, type DomainSynergyTeam, type MatchHistory as DomainMatchHistory, type MatchPlayer as DomainMatchPlayer, type MatchmakingMode as DomainMatchmakingMode, type MatchupAdvisory } from "@shuttle-queue/domain";
 
 export type MatchPlayer = {
   id: string;
@@ -24,11 +24,15 @@ export type MatchPlayer = {
 type PairMap = Map<string, Map<string, number>>;
 export type MatchHistory = { partners: PairMap; opponents: PairMap; quartets: Map<string, number>; encounters?: PairMap; recentPartners?: PairMap; recentOpponents?: PairMap; recentEncounters?: PairMap; recentQuartets?: Map<string, number> };
 export type MatchmakingOptions = { strengthGap?: 1 | 2 | 3; minimumRestMinutes?: number; now?: Date; synergyTeams?: DomainSynergyTeam[] };
-export type Suggestion = { mode: MatchmakingMode; teamA: MatchPlayer[]; teamB: MatchPlayer[]; teamATotal: number; teamBTotal: number; difference: number; key: string; explanation: Record<string, unknown> };
+export type Suggestion = { mode: MatchmakingMode; teamA: MatchPlayer[]; teamB: MatchPlayer[]; teamATotal: number; teamBTotal: number; difference: number; key: string; matchupAdvisory?: MatchupAdvisory | null; explanation: Record<string, unknown> };
 
 export { MATCHMAKING_ALGORITHM };
 const isQualifiedLoneFemaleGroup = (group: MatchPlayer[]) => group.length === 4 && group.filter((player) => player.gender === Gender.FEMALE).length === 1 && group.filter((player) => player.gender === Gender.MALE).length === 3 && group.some((player) => player.gender === Gender.FEMALE && LONE_FEMALE_SKILL_LEVELS.some((level) => level === player.skillLevel));
 export const loneFemalePolicy = (teamA: MatchPlayer[], teamB: MatchPlayer[], mixedDoublesFallback = false) => { const group = [...teamA, ...teamB]; const qualifyingFemale = isQualifiedLoneFemaleGroup(group) ? group.find((player) => player.gender === Gender.FEMALE) : undefined; return { eligibleSkillLevels: ["INTERMEDIATE", "UPPER_INTERMEDIATE", "ADVANCED"], qualifyingFemaleId: qualifyingFemale?.id ?? null, applied: Boolean(qualifyingFemale), mixedDoublesFallback: Boolean(qualifyingFemale && mixedDoublesFallback) }; };
+export const lowSkillLoneFemaleAdvisory = (teamA: Array<{ id: string; displayName: string; gender: string; skillLevel: string }>, teamB: Array<{ id: string; displayName: string; gender: string; skillLevel: string }>): MatchupAdvisory | null => domainLowSkillLoneFemaleAdvisory(
+  teamA.map((player) => ({ ...player, skillLevel: player.skillLevel as DomainMatchPlayer["skillLevel"] })),
+  teamB.map((player) => ({ ...player, skillLevel: player.skillLevel as DomainMatchPlayer["skillLevel"] })),
+);
 export function undefeatedChallengePlayers(players: MatchPlayer[]) {
   const originalById = new Map(players.map((player) => [player.id, player]));
   const input: DomainMatchPlayer[] = players.map(toDomainPlayer);
@@ -101,6 +105,7 @@ export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, hist
     teamBTotal: result.teamBTotal,
     difference: result.difference,
     key: result.key,
+    matchupAdvisory: result.matchupAdvisory ?? null,
     explanation: result.explanation,
   };
 }
