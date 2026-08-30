@@ -5,6 +5,7 @@ import type { AccountRole, QueueMaster } from "@prisma/client";
 import { prisma } from "./db.js";
 import { config } from "./config.js";
 import { AppError, forbidden, unauthorized } from "./errors.js";
+import { slidingIdleExpiry } from "./session-expiry.js";
 
 export type AuthenticatedRequest = Request & {
   auth?: { queueMaster: QueueMaster; sessionId: string; csrfToken: string; csrfTokenHash: string; absoluteExpiresAt: Date; sessionVersion: number };
@@ -62,8 +63,8 @@ export async function issueSession(queueMasterId: string, request: Request, resp
   const secret = token();
   const csrfToken = token();
   const now = new Date();
-  const idleExpiresAt = new Date(now.getTime() + config.sessionIdleMinutes * 60_000);
   const absoluteExpiresAt = new Date(now.getTime() + config.sessionAbsoluteHours * 3_600_000);
+  const idleExpiresAt = slidingIdleExpiry(now, absoluteExpiresAt, config.sessionIdleMinutes);
   const session = await prisma.authSession.create({
     data: {
       queueMasterId,
@@ -85,10 +86,7 @@ export async function rotateSession(request: AuthenticatedRequest, response: Res
   const nextSecret = token();
   const nextCsrf = token();
   const now = new Date();
-  const idleExpiresAt = new Date(Math.min(
-    now.getTime() + config.sessionIdleMinutes * 60_000,
-    current.absoluteExpiresAt.getTime(),
-  ));
+  const idleExpiresAt = slidingIdleExpiry(now, current.absoluteExpiresAt, config.sessionIdleMinutes);
   const claimed = await prisma.authSession.updateMany({
     where: { id: current.sessionId, version: current.sessionVersion },
     data: { previousHash: digest((request.cookies?.[cookieName] ?? "").split(".").slice(1).join(".")), secretHash: digest(nextSecret), csrfTokenHash: digest(nextCsrf), rotatedAt: now, lastSeenAt: now, idleExpiresAt, version: { increment: 1 } },
@@ -103,8 +101,9 @@ export async function rotateSession(request: AuthenticatedRequest, response: Res
 async function resolveAuth(request: AuthenticatedRequest) {
   const parsed = parseSessionCookie(request.cookies?.[cookieName]);
   if (!parsed) throw unauthorized();
+  const now = new Date();
   const session = await prisma.authSession.findUnique({ where: { id: parsed.id }, include: { queueMaster: true } });
-  if (!session || session.revokedAt || session.queueMaster.status !== "ACTIVE" || session.idleExpiresAt < new Date() || session.absoluteExpiresAt < new Date()) throw unauthorized("Your session has expired.");
+  if (!session || session.revokedAt || session.queueMaster.status !== "ACTIVE" || session.idleExpiresAt < now || session.absoluteExpiresAt < now) throw unauthorized("Your session has expired.");
   const secretHash = digest(parsed.secret);
   if (!safeEqual(secretHash, session.secretHash)) {
     if (session.previousHash && safeEqual(secretHash, session.previousHash)) {
@@ -114,8 +113,9 @@ async function resolveAuth(request: AuthenticatedRequest) {
   }
   const csrfToken = request.get("x-csrf-token") ?? "";
   if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS" && !safeEqual(digest(csrfToken), session.csrfTokenHash)) throw new AppError(403, "CSRF_INVALID", "The request could not be verified.");
-  if (session.lastSeenAt.getTime() < Date.now() - 5 * 60_000) {
-    await prisma.authSession.update({ where: { id: session.id }, data: { lastSeenAt: new Date() } });
+  if (session.lastSeenAt.getTime() < now.getTime() - 5 * 60_000) {
+    const idleExpiresAt = slidingIdleExpiry(now, session.absoluteExpiresAt, config.sessionIdleMinutes);
+    await prisma.authSession.updateMany({ where: { id: session.id, revokedAt: null }, data: { lastSeenAt: now, idleExpiresAt } });
   }
   request.auth = { queueMaster: session.queueMaster, sessionId: session.id, csrfToken, csrfTokenHash: session.csrfTokenHash, absoluteExpiresAt: session.absoluteExpiresAt, sessionVersion: session.version };
   return request.auth;

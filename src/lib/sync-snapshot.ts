@@ -19,8 +19,11 @@ export function normalizeQueuePlayerSnapshotFields(snapshot: unknown): unknown {
   return {
     ...value,
     settings: value.settings && typeof value.settings === "object" && !Array.isArray(value.settings)
-      ? { ...(value.settings as Record<string, unknown>), lateArrivalGraceMinutes: (value.settings as Record<string, unknown>).lateArrivalGraceMinutes ?? 10 }
+      ? { ...(value.settings as Record<string, unknown>), lateArrivalGraceMinutes: (value.settings as Record<string, unknown>).lateArrivalGraceMinutes ?? 10, noShowPenaltyMinor: (value.settings as Record<string, unknown>).noShowPenaltyMinor ?? 0 }
       : value.settings,
+    feeConfig: value.feeConfig && typeof value.feeConfig === "object" && !Array.isArray(value.feeConfig)
+      ? { ...(value.feeConfig as Record<string, unknown>), noShowPenaltyMinor: (value.feeConfig as Record<string, unknown>).noShowPenaltyMinor ?? 0 }
+      : value.feeConfig,
     players: Array.isArray(value.players) ? value.players.map((player) => {
       if (!player || typeof player !== "object" || Array.isArray(player)) return player;
       const profile = player as Record<string, unknown>;

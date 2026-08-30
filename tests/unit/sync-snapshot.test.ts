@@ -28,6 +28,12 @@ test("normalizes omitted legacy queue-player fields while preserving supplied va
   assert.equal((snapshot.queuePlayers[0] as Record<string, unknown>).priorityReason, undefined);
 });
 
+test("normalizes omitted no-show penalty fields for legacy snapshots", () => {
+  const normalized = normalizeQueuePlayerSnapshotFields({ settings: { id: "settings" }, feeConfig: { id: "fee" }, queuePlayers: [] }) as { settings: Record<string, unknown>; feeConfig: Record<string, unknown> };
+  assert.equal(normalized.settings.noShowPenaltyMinor, 0);
+  assert.equal(normalized.feeConfig.noShowPenaltyMinor, 0);
+});
+
 test("does not turn invalid supplied values into valid defaults", () => {
   const normalized = normalizeQueuePlayerSnapshotFields({ queuePlayers: [{ amountDueMinor: null, latePenaltyState: "INVALID" }] }) as { queuePlayers: Array<Record<string, unknown>> };
   assert.equal(normalized.queuePlayers[0]!.amountDueMinor, null);

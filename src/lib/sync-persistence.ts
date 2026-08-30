@@ -45,6 +45,7 @@ export function validateSyncSnapshot(snapshot: CloudSnapshotV2) {
   assertUnique(snapshot.matches.map((match) => match.id), "matches", "id");
   assertUnique(snapshot.payments.map((payment) => payment.id), "payments", "id");
   assertUnique(snapshot.audits.map((audit) => audit.id), "audits", "id");
+  assertUnique((snapshot.synergyTeams ?? []).map((team) => String((team as any)?.id ?? "")), "synergyTeams", "id");
   assertUnique(snapshot.matches.flatMap((match) => match.participants.map((participant) => participant.id)), "matchParticipants", "id");
   assertUnique(snapshot.matches.flatMap((match) => match.scoreRevisions.map((revision) => revision.id)), "scoreRevisions", "id");
   assertUnique(snapshot.matches.flatMap((match) => match.scoreRevisions.flatMap((revision) => revision.games.map((game) => game.id))), "matchGames", "id");
@@ -55,6 +56,12 @@ export function validateSyncSnapshot(snapshot: CloudSnapshotV2) {
   const courtIds = new Set(snapshot.courts.map((court) => court.id));
   const revisionIds = new Set(snapshot.matches.flatMap((match) => match.scoreRevisions.map((revision) => revision.id)));
   const paymentIds = new Set(snapshot.payments.map((payment) => payment.id));
+  const synergyMembers = new Set<string>();
+  for (const team of snapshot.synergyTeams ?? []) {
+    const memberIds = (team as any)?.queuePlayerIds;
+    if (!Array.isArray(memberIds) || memberIds.length !== 2 || memberIds.some((id: unknown) => typeof id !== "string") || memberIds[0] === memberIds[1] || memberIds.some((id: string) => !queuePlayerIds.has(id)) || memberIds.some((id: string) => synergyMembers.has(id))) throw conflict("SYNC_SNAPSHOT_CONFLICT", "The offline snapshot contains an invalid Synergy Team reference.");
+    memberIds.forEach((id: string) => synergyMembers.add(id));
+  }
   if (snapshot.queuePlayers.some((player) => !playerIds.has(player.playerId))) throw conflict("SYNC_SNAPSHOT_CONFLICT", "The offline snapshot references a missing player.");
   if (snapshot.payments.some((payment) => !queuePlayerIds.has(payment.queuePlayerId))) throw conflict("SYNC_SNAPSHOT_CONFLICT", "The offline snapshot references a missing queue player.");
   if (snapshot.matches.some((match) => match.courtId !== null && match.courtId !== undefined && !courtIds.has(match.courtId))) throw conflict("SYNC_SNAPSHOT_CONFLICT", "The offline snapshot references a missing court.");
@@ -143,7 +150,7 @@ export async function assertStableNaturalKeys(tx: SyncDatabase, queueMasterId: s
 }
 
 async function existingIds(tx: SyncDatabase, queueMasterId: string) {
-  const [players, queuePlayers, courts, matches, participants, revisions, games, payments] = await Promise.all([
+  const [players, queuePlayers, courts, matches, participants, revisions, games, payments, synergyTeams] = await Promise.all([
     tx.player.findMany({ where: { queueMasterId }, select: { id: true } }),
     tx.queuePlayer.findMany({ where: { queueMasterId }, select: { id: true } }),
     tx.court.findMany({ where: { queueMasterId }, select: { id: true } }),
@@ -152,8 +159,9 @@ async function existingIds(tx: SyncDatabase, queueMasterId: string) {
     tx.matchScoreRevision.findMany({ where: { match: { queueMasterId } }, select: { id: true } }),
     tx.matchGame.findMany({ where: { scoreRevision: { match: { queueMasterId } } }, select: { id: true } }),
     tx.payment.findMany({ where: { queueMasterId }, select: { id: true } }),
+    tx.synergyTeam?.findMany ? tx.synergyTeam.findMany({ where: { queueMasterId }, select: { id: true } }) : Promise.resolve([]),
   ]);
-  return Object.fromEntries(Object.entries({ players, queuePlayers, courts, matches, participants, revisions, games, payments }).map(([key, rows]) => [key, new Set((rows as any[]).map((row) => row.id))]));
+  return Object.fromEntries(Object.entries({ players, queuePlayers, courts, matches, participants, revisions, games, payments, synergyTeams }).map(([key, rows]) => [key, new Set((rows as any[]).map((row) => row.id))]));
 }
 
 const playerData = (player: CloudSnapshotV2["players"][number]) => ({ displayName: player.displayName, normalizedName: normalizeName(player.displayName), gender: player.gender, skillLevel: player.skillLevel, skillWeight: skillWeight(player.skillLevel), status: player.status });
@@ -164,6 +172,7 @@ const participantData = (participant: CloudSnapshotV2["matches"][number]["partic
 const revisionData = (revision: CloudSnapshotV2["matches"][number]["scoreRevisions"][number], queueMasterId: string) => ({ matchId: revision.matchId, revisionNumber: revision.revisionNumber, winnerTeam: revision.winnerTeam, reason: revision.reason ?? null, createdByQueueMasterId: queueMasterId, supersedesRevisionId: revision.supersedesRevisionId ?? null, createdAt: revision.createdAt ? new Date(revision.createdAt) : undefined });
 const gameData = (game: CloudSnapshotV2["matches"][number]["scoreRevisions"][number]["games"][number]) => ({ scoreRevisionId: game.scoreRevisionId, gameNumber: game.gameNumber, teamAScore: game.teamAScore, teamBScore: game.teamBScore, winnerTeam: game.winnerTeam });
 const paymentData = (payment: CloudSnapshotV2["payments"][number]) => ({ queuePlayerId: payment.queuePlayerId, kind: payment.kind, method: payment.method, amountMinor: payment.amountMinor, reference: payment.reference, note: payment.note, reversalOfPaymentId: payment.reversalOfPaymentId, recordedById: payment.recordedById, occurredAt: new Date(payment.occurredAt), createdAt: new Date(payment.createdAt) });
+const synergyTeamData = (team: NonNullable<CloudSnapshotV2["synergyTeams"]>[number]) => ({ queuePlayerIds: team.queuePlayerIds, createdAt: new Date(team.createdAt), version: team.version });
 
 export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: string, snapshot: CloudSnapshotV2, auditEvents: Array<Record<string, unknown>>, operationId: string) {
   const ids = await existingIds(tx, queueMasterId);
@@ -182,6 +191,7 @@ export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: str
     }
   }
   for (const payment of snapshot.payments) await write(tx.payment, payment.id, paymentData(payment), ids.payments, true);
+  if (tx.synergyTeam) for (const team of snapshot.synergyTeams ?? []) await write(tx.synergyTeam, team.id, synergyTeamData(team), ids.synergyTeams, true);
 
   const playerIds = snapshot.players.map((player) => player.id);
   const queuePlayerIds = snapshot.queuePlayers.map((player) => player.id);
@@ -190,17 +200,19 @@ export async function reconcileSyncSnapshot(tx: SyncDatabase, queueMasterId: str
   const revisionIds = snapshot.matches.flatMap((match) => match.scoreRevisions.map((revision) => revision.id));
   const gameIds = snapshot.matches.flatMap((match) => match.scoreRevisions.flatMap((revision) => revision.games.map((game) => game.id)));
   const paymentIds = snapshot.payments.map((payment) => payment.id);
+  const synergyTeamIds = (snapshot.synergyTeams ?? []).map((team) => team.id);
   await tx.matchGame.deleteMany({ where: { scoreRevision: { match: { queueMasterId } }, ...(gameIds.length ? { id: { notIn: gameIds } } : {}) } });
   await tx.matchScoreRevision.deleteMany({ where: { match: { queueMasterId }, ...(revisionIds.length ? { id: { notIn: revisionIds } } : {}) } });
   await tx.match.deleteMany({ where: { queueMasterId, ...(matchIds.length ? { id: { notIn: matchIds } } : {}) } });
   await tx.payment.deleteMany({ where: { queueMasterId, ...(paymentIds.length ? { id: { notIn: paymentIds } } : {}) } });
+  if (tx.synergyTeam) await tx.synergyTeam.deleteMany({ where: { queueMasterId, ...(synergyTeamIds.length ? { id: { notIn: synergyTeamIds } } : {}) } });
   await tx.queuePlayer.deleteMany({ where: { queueMasterId, ...(queuePlayerIds.length ? { id: { notIn: queuePlayerIds } } : {}) } });
   await tx.court.deleteMany({ where: { queueMasterId, ...(courtIds.length ? { id: { notIn: courtIds } } : {}) } });
   await tx.player.deleteMany({ where: { queueMasterId, ...(playerIds.length ? { id: { notIn: playerIds } } : {}) } });
 
-  if (snapshot.settings) await tx.queueMasterSettings.update({ where: { queueMasterId }, data: { pointsToWin: snapshot.settings.pointsToWin, winBy: snapshot.settings.winBy, scoreCap: snapshot.settings.scoreCap, bestOf: snapshot.settings.bestOf, minimumRestMinutes: snapshot.settings.minimumRestMinutes, lateArrivalGraceMinutes: snapshot.settings.lateArrivalGraceMinutes ?? DEFAULT_LATE_ARRIVAL_GRACE_MINUTES, defaultFeeMode: snapshot.settings.defaultFeeMode, defaultFixedFeeMinor: snapshot.settings.defaultFixedFeeMinor, currencyCode: snapshot.settings.currencyCode, timeZone: snapshot.settings.timeZone, defaultLateArrivalCutoffTime: snapshot.settings.defaultLateArrivalCutoffTime } });
+  if (snapshot.settings) await tx.queueMasterSettings.update({ where: { queueMasterId }, data: { pointsToWin: snapshot.settings.pointsToWin, winBy: snapshot.settings.winBy, scoreCap: snapshot.settings.scoreCap, bestOf: snapshot.settings.bestOf, minimumRestMinutes: snapshot.settings.minimumRestMinutes, lateArrivalGraceMinutes: snapshot.settings.lateArrivalGraceMinutes ?? DEFAULT_LATE_ARRIVAL_GRACE_MINUTES, defaultFeeMode: snapshot.settings.defaultFeeMode, defaultFixedFeeMinor: snapshot.settings.defaultFixedFeeMinor, noShowPenaltyMinor: snapshot.settings.noShowPenaltyMinor ?? 0, currencyCode: snapshot.settings.currencyCode, timeZone: snapshot.settings.timeZone, defaultLateArrivalCutoffTime: snapshot.settings.defaultLateArrivalCutoffTime } });
   await tx.queueWorkspace.update({ where: { queueMasterId }, data: { startedAt: new Date(snapshot.workspace.startedAt), endedAt: snapshot.workspace.endedAt ? new Date(snapshot.workspace.endedAt) : null, lateArrivalCutoffAt: snapshot.workspace.lateArrivalCutoffAt ? new Date(snapshot.workspace.lateArrivalCutoffAt) : null, matchmakingAlgorithm: snapshot.workspace.matchmakingAlgorithm, matchmakingRevision: snapshot.workspace.matchmakingRevision, version: snapshot.workspace.version } });
-  if (snapshot.feeConfig) await tx.queueFeeConfig.upsert({ where: { queueMasterId }, create: { queueMasterId, mode: snapshot.feeConfig.mode, currencyCode: snapshot.feeConfig.currencyCode, fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor, expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor, participationRule: snapshot.feeConfig.participationRule, frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null, version: snapshot.feeConfig.version }, update: { mode: snapshot.feeConfig.mode, currencyCode: snapshot.feeConfig.currencyCode, fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor, expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor, participationRule: snapshot.feeConfig.participationRule, frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null, version: snapshot.feeConfig.version } });
+  if (snapshot.feeConfig) await tx.queueFeeConfig.upsert({ where: { queueMasterId }, create: { queueMasterId, mode: snapshot.feeConfig.mode, currencyCode: snapshot.feeConfig.currencyCode, fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor, expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor, noShowPenaltyMinor: snapshot.feeConfig.noShowPenaltyMinor ?? 0, participationRule: snapshot.feeConfig.participationRule, frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null, version: snapshot.feeConfig.version }, update: { mode: snapshot.feeConfig.mode, currencyCode: snapshot.feeConfig.currencyCode, fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor, expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor, noShowPenaltyMinor: snapshot.feeConfig.noShowPenaltyMinor ?? 0, participationRule: snapshot.feeConfig.participationRule, frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null, version: snapshot.feeConfig.version } });
   else await tx.queueFeeConfig.deleteMany({ where: { queueMasterId } });
   for (const event of auditEvents) await tx.auditLog.create({ data: { queueMasterId, action: typeof event.action === "string" ? event.action : "OFFLINE_EVENT", entityType: typeof event.entityType === "string" ? event.entityType : "ACCOUNT", entityId: typeof event.entityId === "string" ? event.entityId : queueMasterId, reason: typeof event.reason === "string" ? event.reason : "Recorded offline", beforeJson: event.beforeJson, afterJson: event.afterJson, requestId: `offline:${operationId}` } });
 }

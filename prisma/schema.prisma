@@ -122,6 +122,7 @@ model QueueMaster {
   workspace             QueueWorkspace?
   players               Player[]
   queuePlayers          QueuePlayer[]
+  synergyTeams          SynergyTeam[]
   courts                Court[]
   matches               Match[]
   feeConfig             QueueFeeConfig?
@@ -154,6 +155,7 @@ model QueueMasterSettings {
   lateArrivalGraceMinutes Int              @default(10)
   defaultFeeMode        FeeMode            @default(FIXED_PER_PLAYER)
   defaultFixedFeeMinor  Int?
+  noShowPenaltyMinor    Int               @default(0)
   currencyCode          String             @default("PHP")
   timeZone              String             @default("Asia/Manila")
   defaultLateArrivalCutoffTime String?
@@ -320,6 +322,18 @@ model QueuePlayer {
   @@index([currentMatchId])
 }
 
+model SynergyTeam {
+  id             String      @id @default(uuid()) @map("_id")
+  queueMasterId  String
+  queueMaster    QueueMaster @relation(fields: [queueMasterId], references: [id], onDelete: Cascade)
+  queuePlayerIds String[]
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  version        Int         @default(1)
+
+  @@index([queueMasterId, createdAt])
+}
+
 model Court {
   id             String       @id @default(uuid()) @map("_id")
   queueMasterId  String
@@ -415,6 +429,7 @@ model QueueFeeConfig {
   currencyCode             String       @default("PHP")
   fixedAmountPerPlayerMinor Int?
   expectedQueueCostMinor   Int?
+  noShowPenaltyMinor       Int          @default(0)
   participationRule       String       @default("EVER_CHECKED_IN")
   frozenAt                 DateTime?
   createdAt                DateTime      @default(now())

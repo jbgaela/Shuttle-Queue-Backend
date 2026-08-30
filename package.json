@@ -21,10 +21,12 @@
     "seed": "node --env-file=.env --import tsx prisma/seed.ts",
     "db:reset-data": "node --env-file=.env --import tsx prisma/reset-data.ts",
     "migrate:remove-sessions": "node --env-file=.env --import tsx prisma/migrate-remove-sessions.ts",
+    "migrate:no-show-penalty": "node --env-file=.env --import tsx prisma/migrate-no-show-penalty.ts",
     "migrate:upper-beginner": "node --env-file=.env --import tsx prisma/migrate-upper-beginner.ts",
     "test": "npm run prisma:generate && tsx --test tests/unit/*.test.ts",
     "test:unit": "node --test tests/unit/**/*.test.js",
-    "test:domain": "npm run build:domain && npm run test --workspace @shuttle-queue/domain"
+    "test:domain": "npm run build:domain && npm run test --workspace @shuttle-queue/domain",
+    "deploy": "npx prisma db push && npx prisma generate"
   },
   "dependencies": {
     "@shuttle-queue/domain": "*",
