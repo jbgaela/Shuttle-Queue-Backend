@@ -89,7 +89,7 @@ const toDomainPlayer = (player: MatchPlayer): DomainMatchPlayer => ({
 /** The deploy-local domain package is the single source of truth for matchmaking. */
 export function suggestMatch(players: MatchPlayer[], mode: MatchmakingMode, history: MatchHistory, excludedKeys: string[] = [], options: MatchmakingOptions = {}): Suggestion | null {
   const originalById = new Map(players.map((player) => [player.id, player]));
-  const synergyTeams = options.synergyTeams ?? (history as MatchHistory & { synergyTeams?: DomainSynergyTeam[] }).synergyTeams;
+  const synergyTeams = options.synergyTeams ?? [];
   const result = suggestDomainMatch(players.map(toDomainPlayer), mode as DomainMatchmakingMode, history as unknown as DomainMatchHistory, excludedKeys, { ...options, synergyTeams });
   if (!result) return null;
   const toLocal = (player: DomainMatchPlayer): MatchPlayer => {
