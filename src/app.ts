@@ -26,6 +26,7 @@ import { datePartsForInstant, inclusiveMinuteCutoff } from "./lib/timezone.js";
 import { allocateFinalFeeAmounts } from "@shuttle-queue/domain";
 import { activePublicRankingWhere, isPublicRankingSnapshot, publicHistoryFromMatches, publicHistoryFromSnapshot, publicMatchFromRecord, publicPlayerKey, publicRankingSnapshotFromRecords, recalculatePublicRankingRows, PUBLIC_RANKING_MATCH_LIMIT } from "./lib/public-rankings.js";
 import { PRIZE_RANKING_METHOD, rankRecords, rankingStats } from "./lib/prize-ranking.js";
+import { parseIfMatchVersion, resolvePublishVersion } from "./lib/version.js";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 
 const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "password", "passwordHash"] });
@@ -133,7 +134,21 @@ const responseData = (response: Response, data: unknown, status = 200, meta?: un
 };
 const noContent = (response: Response) => response.status(204).end();
 const authUser = (request: Request) => { const auth = (request as AuthenticatedRequest).auth; if (!auth) throw unauthorized(); return auth.queueMaster; };
-const versionFrom = (request: Request) => { const value = request.get("if-match"); return value === undefined ? undefined : Number(value); };
+const versionFrom = (request: Request) => parseIfMatchVersion(request.get("if-match"));
+const publishVersionFrom = (request: Request) => {
+  const headerValue = request.get("if-match");
+  const bodyValue = request.body && typeof request.body === "object" ? (request.body as Record<string, unknown>).version : undefined;
+  const resolved = resolvePublishVersion(headerValue, bodyValue);
+  if (resolved.mismatch) {
+    logger.warn({ requestId: request.id, headerPresent: resolved.headerPresent, bodyPresent: resolved.bodyPresent }, "public rankings publish versions do not match");
+    throw conflict("VERSION_CONFLICT", "The data changed on another device.");
+  }
+  const version = resolved.version;
+  if (version === undefined) {
+    logger.warn({ requestId: request.id, headerPresent: resolved.headerPresent, bodyPresent: resolved.bodyPresent }, "public rankings publish version missing or invalid");
+  }
+  return version;
+};
 const assertVersion = (actual: number, expected?: number) => { if (expected === undefined || !Number.isInteger(expected)) throw conflict("VERSION_REQUIRED", "The current workspace version is required."); if (actual !== expected) throw conflict("VERSION_CONFLICT", "The data changed on another device."); };
 const owner = (request: Request, id: string | string[]) => ({ id: String(id), queueMasterId: authUser(request).id });
 
@@ -879,7 +894,7 @@ api.get("/workspace/public-rankings", requireAuth, route(async (request, respons
 api.post("/workspace/public-rankings/publish", requireAuth, requireMutationOrigin, route(async (request, response) => {
   const queueMasterId = authUser(request).id;
   const workspace = await workspaceFor(request);
-  assertVersion(workspace.version, versionFrom(request));
+  assertVersion(workspace.version, publishVersionFrom(request));
   const result = await withTransactionRetry(async (tx) => {
     const existing = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: workspace.startedAt } });
     if (existing?.enabled && !existing.revokedAt) return existing;
