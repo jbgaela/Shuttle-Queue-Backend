@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseBodyVersion, parseIfMatchVersion, resolvePublishVersion } from "../../src/lib/version.js";
+import { parseBodyVersion, parseIfMatchVersion, resolveProxySafeVersion } from "../../src/lib/version.js";
 
 test("workspace version parser accepts legacy and quoted If-Match values", () => {
   assert.equal(parseIfMatchVersion("42"), 42);
@@ -24,8 +24,8 @@ test("body version fallback accepts only safe integers", () => {
   assert.equal(parseBodyVersion(Number.MAX_SAFE_INTEGER + 1), undefined);
 });
 
-test("publish version resolution falls back to the body when the proxy omits If-Match", () => {
-  assert.deepEqual(resolvePublishVersion(undefined, 42), {
+test("proxy-safe version resolution falls back to the body when the proxy omits If-Match", () => {
+  assert.deepEqual(resolveProxySafeVersion(undefined, 42), {
     headerPresent: false,
     bodyPresent: true,
     mismatch: false,
@@ -33,9 +33,9 @@ test("publish version resolution falls back to the body when the proxy omits If-
   });
 });
 
-test("publish version resolution requires matching header and body versions", () => {
-  assert.equal(resolvePublishVersion('"42"', 42).version, 42);
-  assert.equal(resolvePublishVersion('"42"', 43).mismatch, true);
-  assert.equal(resolvePublishVersion("not-a-version", 42).version, undefined);
-  assert.equal(resolvePublishVersion(undefined, undefined).version, undefined);
+test("proxy-safe version resolution requires matching header and body versions", () => {
+  assert.equal(resolveProxySafeVersion('"42"', 42).version, 42);
+  assert.equal(resolveProxySafeVersion('"42"', 43).mismatch, true);
+  assert.equal(resolveProxySafeVersion("not-a-version", 42).version, undefined);
+  assert.equal(resolveProxySafeVersion(undefined, undefined).version, undefined);
 });

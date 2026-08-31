@@ -17,7 +17,7 @@ export function parseBodyVersion(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
 }
 
-export function resolvePublishVersion(headerValue: string | undefined, bodyValue: unknown) {
+export function resolveProxySafeVersion(headerValue: string | undefined, bodyValue: unknown) {
   const headerPresent = headerValue !== undefined;
   const bodyPresent = bodyValue !== undefined;
   const headerVersion = parseIfMatchVersion(headerValue);
@@ -29,3 +29,7 @@ export function resolvePublishVersion(headerValue: string | undefined, bodyValue
     version: headerPresent && headerVersion === undefined ? undefined : headerVersion ?? bodyVersion,
   };
 }
+
+// Keep the original publish-specific name available for clients that imported
+// the helper during the initial proxy-safe publishing rollout.
+export const resolvePublishVersion = resolveProxySafeVersion;
