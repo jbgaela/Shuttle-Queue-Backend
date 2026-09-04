@@ -1,5 +1,5 @@
 import { Gender, MatchmakingMode, QueuePlayerStatus } from "@prisma/client";
-import { MATCHMAKING_ALGORITHM, LONE_FEMALE_SKILL_LEVELS, lowSkillLoneFemaleAdvisory as domainLowSkillLoneFemaleAdvisory, isMixedDoublesGroup as isDomainMixedDoublesGroup, isStandardMixedDoublesLineup as isDomainStandardMixedDoublesLineup, suggestMatch as suggestDomainMatch, undefeatedChallengePlayers as domainUndefeatedChallengePlayers, validateMixedDoublesLineup as validateDomainMixedDoublesLineup, validateSynergyLineup as validateDomainSynergyLineup, type DomainSynergyTeam, type MatchHistory as DomainMatchHistory, type MatchPlayer as DomainMatchPlayer, type MatchmakingMode as DomainMatchmakingMode, type MatchupAdvisory } from "@shuttle-queue/domain";
+import { GUIDED_GUIDE_SKILL_LEVELS, GUIDED_LEARNER_SKILL_LEVELS, LONE_FEMALE_SKILL_LEVELS, MATCHMAKING_ALGORITHM, buildGuidedExplanation as domainBuildGuidedExplanation, evaluateGuidedAvailability as evaluateDomainGuidedAvailability, guidedPlayerRole as domainGuidedPlayerRole, lowSkillLoneFemaleAdvisory as domainLowSkillLoneFemaleAdvisory, isGuidedMatchAvailable as isDomainGuidedMatchAvailable, isMixedDoublesGroup as isDomainMixedDoublesGroup, isStandardMixedDoublesLineup as isDomainStandardMixedDoublesLineup, suggestMatch as suggestDomainMatch, undefeatedChallengePlayers as domainUndefeatedChallengePlayers, validateGuidedLineup as validateDomainGuidedLineup, validateMixedDoublesLineup as validateDomainMixedDoublesLineup, validateSynergyLineup as validateDomainSynergyLineup, type DomainSynergyTeam, type GuidedAvailabilitySummary as DomainGuidedAvailabilitySummary, type GuidedLineupPlayer, type MatchHistory as DomainMatchHistory, type MatchPlayer as DomainMatchPlayer, type MatchmakingMode as DomainMatchmakingMode, type MatchupAdvisory } from "@shuttle-queue/domain";
 
 export type MatchPlayer = {
   id: string;
@@ -27,6 +27,10 @@ export type MatchmakingOptions = { strengthGap?: 1 | 2 | 3; minimumRestMinutes?:
 export type Suggestion = { mode: MatchmakingMode; teamA: MatchPlayer[]; teamB: MatchPlayer[]; teamATotal: number; teamBTotal: number; difference: number; key: string; matchupAdvisory?: MatchupAdvisory | null; explanation: Record<string, unknown> };
 
 export { MATCHMAKING_ALGORITHM };
+export { GUIDED_GUIDE_SKILL_LEVELS, GUIDED_LEARNER_SKILL_LEVELS };
+export type GuidedAvailabilitySummary = DomainGuidedAvailabilitySummary;
+export const buildGuidedExplanation = (players: ReadonlyArray<Pick<MatchPlayer, "id" | "skillLevel">>) => domainBuildGuidedExplanation(players as ReadonlyArray<GuidedLineupPlayer>);
+export const guidedPlayerRole = (player: Pick<MatchPlayer, "skillLevel">) => domainGuidedPlayerRole({ skillLevel: player.skillLevel as DomainMatchPlayer["skillLevel"] });
 const isQualifiedLoneFemaleGroup = (group: MatchPlayer[]) => group.length === 4 && group.filter((player) => player.gender === Gender.FEMALE).length === 1 && group.filter((player) => player.gender === Gender.MALE).length === 3 && group.some((player) => player.gender === Gender.FEMALE && LONE_FEMALE_SKILL_LEVELS.some((level) => level === player.skillLevel));
 export const loneFemalePolicy = (teamA: MatchPlayer[], teamB: MatchPlayer[], mixedDoublesFallback = false) => { const group = [...teamA, ...teamB]; const qualifyingFemale = isQualifiedLoneFemaleGroup(group) ? group.find((player) => player.gender === Gender.FEMALE) : undefined; return { eligibleSkillLevels: ["INTERMEDIATE", "UPPER_INTERMEDIATE", "ADVANCED"], qualifyingFemaleId: qualifyingFemale?.id ?? null, applied: Boolean(qualifyingFemale), mixedDoublesFallback: Boolean(qualifyingFemale && mixedDoublesFallback) }; };
 export const lowSkillLoneFemaleAdvisory = (teamA: Array<{ id: string; displayName: string; gender: string; skillLevel: string }>, teamB: Array<{ id: string; displayName: string; gender: string; skillLevel: string }>): MatchupAdvisory | null => domainLowSkillLoneFemaleAdvisory(
@@ -114,6 +118,9 @@ const toDomainLineup = (players: MatchPlayer[]): DomainMatchPlayer[] => players.
 export const isMixedDoublesGroup = (group: MatchPlayer[]) => isDomainMixedDoublesGroup(toDomainLineup(group));
 export const isStandardMixedDoublesLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[]) => isDomainStandardMixedDoublesLineup(toDomainLineup(teamA), toDomainLineup(teamB));
 export const validateMixedDoublesLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[]) => validateDomainMixedDoublesLineup(toDomainLineup(teamA), toDomainLineup(teamB));
+export const validateGuidedLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[]) => validateDomainGuidedLineup(toDomainLineup(teamA), toDomainLineup(teamB));
+export const isGuidedMatchAvailable = (players: MatchPlayer[], options: MatchmakingOptions = {}) => isDomainGuidedMatchAvailable(players.map(toDomainPlayer), { ...options, synergyTeams: options.synergyTeams ?? [] });
+export const evaluateGuidedAvailability = (players: MatchPlayer[], options: MatchmakingOptions = {}): GuidedAvailabilitySummary => evaluateDomainGuidedAvailability(players.map(toDomainPlayer), { ...options, synergyTeams: options.synergyTeams ?? [] });
 export const validateSynergyLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[], teams: DomainSynergyTeam[] = []) => {
   const byId = new Map([...teamA, ...teamB].map((player) => [player.id, player]));
   const weights: Record<string, number> = { NEWBIE: 1, BEGINNER: 2, UPPER_BEGINNER: 3, INTERMEDIATE: 4, UPPER_INTERMEDIATE: 5, ADVANCED: 6 };

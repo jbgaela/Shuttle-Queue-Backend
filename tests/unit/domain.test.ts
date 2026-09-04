@@ -4,7 +4,7 @@ import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/cl
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
 import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView, playerHistoryStats } from "../../src/lib/history.js";
-import { isProhibitedGeneratedGenderMatch, isProhibitedGeneratedNewbieMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, validateMixedDoublesLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
+import { isGuidedMatchAvailable, isProhibitedGeneratedGenderMatch, isProhibitedGeneratedNewbieMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, validateGuidedLineup, validateMixedDoublesLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
 
@@ -111,6 +111,16 @@ test("generated matches require Newbies to partner with Beginner or Upper Beginn
   assert.equal(suggestMatch([make("n1", "NEWBIE", 1), make("i1", "INTERMEDIATE", 4), make("i2", "INTERMEDIATE", 4), make("i3", "INTERMEDIATE", 4)], MatchmakingMode.OPEN, history), null);
   const undefeated = ["n1", "n2", "n3", "n4"].map((id) => ({ ...make(id, "NEWBIE", 1), gamesPlayed: 4, wins: 4 }));
   assert.equal(suggestMatch(undefeated, MatchmakingMode.UNDEFEATED_CHALLENGE, history), null);
+});
+
+test("backend matchmaking accepts the Guided learner-guide composition", () => {
+  const make = (id: string, skillLevel: MatchPlayer["skillLevel"], skillWeight: number): MatchPlayer => ({ ...player(id, Gender.MALE, skillWeight), skillLevel });
+  const players = [make("n1", "NEWBIE", 1), make("b1", "BEGINNER", 2), make("i1", "INTERMEDIATE", 4), make("i2", "INTERMEDIATE", 4)];
+  const suggestion = suggestMatch(players, MatchmakingMode.GUIDED, history);
+  assert.ok(suggestion);
+  assert.equal(validateGuidedLineup(suggestion.teamA, suggestion.teamB), null);
+  assert.equal(isGuidedMatchAvailable(players), true);
+  assert.equal(suggestMatch([make("n1", "NEWBIE", 1), make("i1", "INTERMEDIATE", 4), make("i2", "INTERMEDIATE", 4), make("i3", "INTERMEDIATE", 4)], MatchmakingMode.GUIDED, history), null);
 });
 
 test("late penalties are minimized before existing fairness rules", () => {
