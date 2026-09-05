@@ -378,3 +378,31 @@ test("undefeated challenge qualification uses the wins-first top-three order", (
   const suggestion = suggestMatch(players.map((value) => ({ ...value, gamesPlayed: value.id === "a" ? 5 : value.gamesPlayed, wins: value.id === "a" ? 5 : value.wins })), MatchmakingMode.UNDEFEATED_CHALLENGE, history);
   assert.ok(suggestion);
 });
+
+test("undefeated challenge applies ordered +1, +2, then equal fallback", () => {
+  const make = (id: string, skillWeight: number): MatchPlayer => ({ ...player(id, Gender.MALE, skillWeight), skillLevel: skillWeight === 2 ? "BEGINNER" : skillWeight === 3 ? "UPPER_BEGINNER" : "INTERMEDIATE", gamesPlayed: id === "q" ? 5 : 0, wins: id === "q" ? 5 : 0, losses: 0 });
+  const advantage = (result: NonNullable<ReturnType<typeof suggestMatch>>) => {
+    const qualifierId = (result.explanation.challenge as { selectedPlayerIds: string[] }).selectedPlayerIds[0];
+    const qualifierTeam = result.teamA.some((value) => value.id === qualifierId) ? result.teamA : result.teamB;
+    const opponentTeam = qualifierTeam === result.teamA ? result.teamB : result.teamA;
+    return opponentTeam.reduce((sum, value) => sum + value.skillWeight, 0) - qualifierTeam.reduce((sum, value) => sum + value.skillWeight, 0);
+  };
+  const plusOne = suggestMatch([make("q", 2), make("p1", 2), make("p2", 3), make("p3", 4)], MatchmakingMode.UNDEFEATED_CHALLENGE, history);
+  assert.ok(plusOne);
+  assert.equal(advantage(plusOne), 1);
+  const plusTwo = suggestMatch([make("q", 2), make("p1", 2), make("p2", 3), make("p3", 5)], MatchmakingMode.UNDEFEATED_CHALLENGE, history);
+  assert.ok(plusTwo);
+  assert.equal(advantage(plusTwo), 2);
+  const equal = suggestMatch([make("q", 2), make("p1", 2), make("p2", 2), make("p3", 2)], MatchmakingMode.UNDEFEATED_CHALLENGE, history);
+  assert.ok(equal);
+  assert.equal(advantage(equal), 0);
+});
+
+test("challenge keeps a five-win qualifier when a Synergy partner has more games", () => {
+  const make = (id: string, gamesPlayed: number, wins: number): MatchPlayer => ({ ...player(id, Gender.MALE, 2), gamesPlayed, wins, losses: 0 });
+  const result = suggestMatch([make("q", 5, 5), { ...make("partner", 6, 5), losses: 1 }, make("s1", 0, 0), make("s2", 0, 0)], MatchmakingMode.UNDEFEATED_CHALLENGE, history, [], { synergyTeams: [{ id: "q-pair", queuePlayerIds: ["q", "partner"] }] });
+  assert.ok(result);
+  const challenge = result.explanation.challenge as { selectedPlayerIds: string[]; qualifyingPlayers: Array<{ id: string; gamesPlayed: number }> };
+  assert.equal(challenge.selectedPlayerIds.includes("q"), true);
+  assert.equal(challenge.qualifyingPlayers.some((value) => value.id === "q" && value.gamesPlayed === 5), true);
+});
