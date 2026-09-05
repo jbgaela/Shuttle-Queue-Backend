@@ -1,5 +1,5 @@
 import { Gender, MatchmakingMode, QueuePlayerStatus } from "@prisma/client";
-import { GUIDED_GUIDE_SKILL_LEVELS, GUIDED_LEARNER_SKILL_LEVELS, LONE_FEMALE_SKILL_LEVELS, MATCHMAKING_ALGORITHM, buildGuidedExplanation as domainBuildGuidedExplanation, evaluateGuidedAvailability as evaluateDomainGuidedAvailability, guidedPlayerRole as domainGuidedPlayerRole, lowSkillLoneFemaleAdvisory as domainLowSkillLoneFemaleAdvisory, isGuidedMatchAvailable as isDomainGuidedMatchAvailable, isMixedDoublesGroup as isDomainMixedDoublesGroup, isStandardMixedDoublesLineup as isDomainStandardMixedDoublesLineup, suggestMatch as suggestDomainMatch, undefeatedChallengePlayers as domainUndefeatedChallengePlayers, validateGuidedLineup as validateDomainGuidedLineup, validateMixedDoublesLineup as validateDomainMixedDoublesLineup, validateSynergyLineup as validateDomainSynergyLineup, type DomainSynergyTeam, type GuidedAvailabilitySummary as DomainGuidedAvailabilitySummary, type GuidedLineupPlayer, type MatchHistory as DomainMatchHistory, type MatchPlayer as DomainMatchPlayer, type MatchmakingMode as DomainMatchmakingMode, type MatchupAdvisory } from "@shuttle-queue/domain";
+import { GUIDED_GUIDE_SKILL_LEVELS, GUIDED_LEARNER_SKILL_LEVELS, LONE_FEMALE_SKILL_LEVELS, MATCHMAKING_ALGORITHM, UNDEFEATED_CHALLENGE_MINIMUM_MATCHES as DOMAIN_UNDEFEATED_CHALLENGE_MINIMUM_MATCHES, UNDEFEATED_CHALLENGE_RANK_LIMIT as DOMAIN_UNDEFEATED_CHALLENGE_RANK_LIMIT, buildGuidedExplanation as domainBuildGuidedExplanation, evaluateGuidedAvailability as evaluateDomainGuidedAvailability, guidedPlayerRole as domainGuidedPlayerRole, lowSkillLoneFemaleAdvisory as domainLowSkillLoneFemaleAdvisory, isGuidedMatchAvailable as isDomainGuidedMatchAvailable, isMixedDoublesGroup as isDomainMixedDoublesGroup, isStandardMixedDoublesLineup as isDomainStandardMixedDoublesLineup, suggestMatch as suggestDomainMatch, undefeatedChallengePlayers as domainUndefeatedChallengePlayers, validateGuidedLineup as validateDomainGuidedLineup, validateMatchmakingConstraints as validateDomainMatchmakingConstraints, validateMixedDoublesLineup as validateDomainMixedDoublesLineup, validateSynergyLineup as validateDomainSynergyLineup, type DomainSynergyTeam, type GuidedAvailabilitySummary as DomainGuidedAvailabilitySummary, type GuidedLineupPlayer, type MatchHistory as DomainMatchHistory, type MatchPlayer as DomainMatchPlayer, type MatchmakingMode as DomainMatchmakingMode, type MatchupAdvisory } from "@shuttle-queue/domain";
 
 export type MatchPlayer = {
   id: string;
@@ -27,6 +27,8 @@ export type MatchmakingOptions = { strengthGap?: 1 | 2 | 3; minimumRestMinutes?:
 export type Suggestion = { mode: MatchmakingMode; teamA: MatchPlayer[]; teamB: MatchPlayer[]; teamATotal: number; teamBTotal: number; difference: number; key: string; matchupAdvisory?: MatchupAdvisory | null; explanation: Record<string, unknown> };
 
 export { MATCHMAKING_ALGORITHM };
+export const UNDEFEATED_CHALLENGE_MINIMUM_MATCHES = DOMAIN_UNDEFEATED_CHALLENGE_MINIMUM_MATCHES;
+export const UNDEFEATED_CHALLENGE_RANK_LIMIT = DOMAIN_UNDEFEATED_CHALLENGE_RANK_LIMIT;
 export { GUIDED_GUIDE_SKILL_LEVELS, GUIDED_LEARNER_SKILL_LEVELS };
 export type GuidedAvailabilitySummary = DomainGuidedAvailabilitySummary;
 export const buildGuidedExplanation = (players: ReadonlyArray<Pick<MatchPlayer, "id" | "skillLevel">>) => domainBuildGuidedExplanation(players as ReadonlyArray<GuidedLineupPlayer>);
@@ -37,10 +39,10 @@ export const lowSkillLoneFemaleAdvisory = (teamA: Array<{ id: string; displayNam
   teamA.map((player) => ({ ...player, skillLevel: player.skillLevel as DomainMatchPlayer["skillLevel"] })),
   teamB.map((player) => ({ ...player, skillLevel: player.skillLevel as DomainMatchPlayer["skillLevel"] })),
 );
-export function undefeatedChallengePlayers(players: MatchPlayer[]) {
+export function undefeatedChallengePlayers(players: MatchPlayer[], minimumMatches = UNDEFEATED_CHALLENGE_MINIMUM_MATCHES, rankLimit = UNDEFEATED_CHALLENGE_RANK_LIMIT) {
   const originalById = new Map(players.map((player) => [player.id, player]));
   const input: DomainMatchPlayer[] = players.map(toDomainPlayer);
-  return domainUndefeatedChallengePlayers(input).flatMap(({ player, rank }) => {
+  return domainUndefeatedChallengePlayers(input, minimumMatches, rankLimit).flatMap(({ player, rank }) => {
     const original = originalById.get(player.id);
     return original ? [{ player: original, rank }] : [];
   });
@@ -70,6 +72,7 @@ export const validateBalancedLineup = (teamA: MatchPlayer[], teamB: MatchPlayer[
   if (teamDifference !== strengthGap) return `Handicap matchups require team strength totals to differ by exactly ${strengthGap}.`;
   return null;
 };
+export const validateMatchmakingConstraints = (mode: MatchmakingMode, teamA: MatchPlayer[], teamB: MatchPlayer[], strengthGap = 1) => validateDomainMatchmakingConstraints(mode as DomainMatchmakingMode, teamA.map(toDomainPlayer), teamB.map(toDomainPlayer), strengthGap);
 
 const toDomainPlayer = (player: MatchPlayer): DomainMatchPlayer => ({
   id: player.id,

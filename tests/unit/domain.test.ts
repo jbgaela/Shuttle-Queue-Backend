@@ -373,8 +373,8 @@ test("player history stats average valid durations and count partners and oppone
 });
 
 test("undefeated challenge qualification uses the wins-first top-three order", () => {
-  const players = ["a", "b", "c", "d"].map((id, index) => ({ ...player(id, Gender.MALE, 2), gamesPlayed: index === 0 ? 3 : 4, wins: index === 2 ? 3 : index === 0 ? 3 : 4, losses: index === 2 ? 1 : 0 }));
+  const players = ["a", "b", "c", "d"].map((id, index) => ({ ...player(id, Gender.MALE, 2), gamesPlayed: index === 0 ? 3 : 5, wins: index === 2 ? 4 : index === 0 ? 3 : 5, losses: index === 2 ? 1 : 0 }));
   assert.deepEqual(undefeatedChallengePlayers(players).map(({ player: value }) => value.id), ["b", "d"]);
-  const suggestion = suggestMatch(players.map((value) => ({ ...value, gamesPlayed: value.id === "a" ? 4 : value.gamesPlayed, wins: value.id === "a" ? 4 : value.wins })), MatchmakingMode.UNDEFEATED_CHALLENGE, history);
+  const suggestion = suggestMatch(players.map((value) => ({ ...value, gamesPlayed: value.id === "a" ? 5 : value.gamesPlayed, wins: value.id === "a" ? 5 : value.wins })), MatchmakingMode.UNDEFEATED_CHALLENGE, history);
   assert.ok(suggestion);
 });

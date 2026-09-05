@@ -171,7 +171,7 @@ model QueueWorkspace {
   startedAt              DateTime    @default(now())
   endedAt                DateTime?
   lateArrivalCutoffAt    DateTime?
-  matchmakingAlgorithm   String      @default("v4-upper-beginner-strict-balance")
+  matchmakingAlgorithm   String      @default("v12-undefeated-five-match-threshold")
   matchmakingRevision    Int         @default(1)
   createdAt              DateTime    @default(now())
   updatedAt              DateTime    @updatedAt

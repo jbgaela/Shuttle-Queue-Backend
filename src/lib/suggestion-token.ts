@@ -10,10 +10,7 @@ const modeSchema = z.enum([
   "UNDEFEATED_CHALLENGE",
   "GUIDED",
 ]);
-const teamSchema = z.union([
-  z.tuple([z.string().min(1)]),
-  z.tuple([z.string().min(1), z.string().min(1)]),
-]);
+const teamSchema = z.tuple([z.string().min(1), z.string().min(1)]);
 
 export const suggestionTokenPayloadSchema = z.object({
   algorithmVersion: z.string().min(1),
