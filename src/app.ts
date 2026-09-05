@@ -230,7 +230,8 @@ api.put("/sync/snapshot", (request, _response, next) => {
 api.use((request, _response, next) => {
   if (request.method === "GET" || !(request as AuthenticatedRequest).auth) { next(); return; }
   const allowedAfterEnd = ["/workspace/end", "/workspace/start-fresh", "/workspace/public-rankings", "/payments", "/players", "/settings", "/auth/", "/admin/", "/sync/"];
-  if (allowedAfterEnd.some((prefix) => request.path === prefix || request.path.startsWith(prefix))) { next(); return; }
+  const completedCorrection = /^\/matches\/[^/]+\/(?:correct|correct-participants)$/.test(request.path);
+  if (completedCorrection || allowedAfterEnd.some((prefix) => request.path === prefix || request.path.startsWith(prefix))) { next(); return; }
   activeWorkspaceFor(request).then(() => next()).catch(next);
 });
 
@@ -264,14 +265,14 @@ function matchmakingPlayerFromQueuePlayer(player: any, byId: Map<string, any>, s
   const effectiveWeight = synergyTeam && partner ? Math.max(rawWeight, skillWeight(partner.skillLevelSnapshot as SkillLevel)) : rawWeight;
   return { id: player.id, displayName: player.displayNameSnapshot, gender: player.genderSnapshot, skillWeight: rawWeight, skillLevel: player.skillLevelSnapshot, effectiveSkillWeight: effectiveWeight, effectiveSkillLevel: effectiveSkillLevel(effectiveWeight, player.skillLevelSnapshot as SkillLevel), synergyTeamId: synergyTeam?.id, status: player.status, gamesPlayed: player.matchesPlayed, wins: player.wins, losses: player.losses, queueEnteredAt: player.queueEnteredAt, lastMatchEndedAt: player.lastMatchEndedAt, manualPriority: player.manualPriority, latePenaltyState: player.latePenaltyState, latePenaltyAppliedAt: player.latePenaltyAppliedAt };
 }
-function queuePlayerView(player: any, minimumRestMinutes = 0, teamsByPlayer = new Map<string, SynergyTeamRecord>(), queuePlayersById = new Map<string, any>()) {
+function queuePlayerView(player: any, minimumRestMinutes = 0, teamsByPlayer = new Map<string, SynergyTeamRecord>(), queuePlayersById = new Map<string, any>(), reference = Date.now()) {
   const team = teamsByPlayer.get(player.id);
   const partnerId = team?.queuePlayerIds.find((id) => id !== player.id);
   const partner = partnerId ? queuePlayersById.get(partnerId) : undefined;
   const originalWeight = skillWeight(player.skillLevelSnapshot as SkillLevel);
   const partnerWeight = partner ? skillWeight(partner.skillLevelSnapshot as SkillLevel) : originalWeight;
   const effectiveWeight = team ? Math.max(originalWeight, partnerWeight ?? originalWeight) : originalWeight;
-  return { id: player.id, playerId: player.playerId, displayName: player.displayNameSnapshot, gender: player.genderSnapshot, skillLevel: player.skillLevelSnapshot, skillWeight: originalWeight, effectiveSkillLevel: effectiveSkillLevel(effectiveWeight, player.skillLevelSnapshot as SkillLevel), effectiveSkillWeight: effectiveWeight, synergyTeamId: team?.id ?? null, synergyPartnerName: partner?.displayNameSnapshot ?? null, status: player.status, queueEnteredAt: player.queueEnteredAt, lastMatchEndedAt: player.lastMatchEndedAt, restEligibleAt: restEligibleAt(player.lastMatchEndedAt, minimumRestMinutes), matchesPlayed: player.matchesPlayed, wins: player.wins, losses: player.losses, pointsFor: player.pointsFor, pointsAgainst: player.pointsAgainst, amountDueMinor: player.amountDueMinor, manualPriority: player.manualPriority, currentMatchId: player.currentMatchId, latePenaltyState: player.latePenaltyState, latePenaltyAppliedAt: player.latePenaltyAppliedAt, checkedInAt: player.checkedInAt, checkedOutAt: player.checkedOutAt, restStartedAt: player.restStartedAt, version: player.version };
+  return { id: player.id, playerId: player.playerId, displayName: player.displayNameSnapshot, gender: player.genderSnapshot, skillLevel: player.skillLevelSnapshot, skillWeight: originalWeight, effectiveSkillLevel: effectiveSkillLevel(effectiveWeight, player.skillLevelSnapshot as SkillLevel), effectiveSkillWeight: effectiveWeight, synergyTeamId: team?.id ?? null, synergyPartnerName: partner?.displayNameSnapshot ?? null, status: player.status, queueEnteredAt: player.queueEnteredAt, lastMatchEndedAt: player.lastMatchEndedAt, restEligibleAt: restEligibleAt(player.lastMatchEndedAt, minimumRestMinutes, reference), matchesPlayed: player.matchesPlayed, wins: player.wins, losses: player.losses, pointsFor: player.pointsFor, pointsAgainst: player.pointsAgainst, amountDueMinor: player.amountDueMinor, manualPriority: player.manualPriority, currentMatchId: player.currentMatchId, latePenaltyState: player.latePenaltyState, latePenaltyAppliedAt: player.latePenaltyAppliedAt, checkedInAt: player.checkedInAt, checkedOutAt: player.checkedOutAt, restStartedAt: player.restStartedAt, version: player.version };
 }
 async function loadSynergyTeams(queueMasterId: string, database = db): Promise<SynergyTeamRecord[]> {
   const rows = await database.synergyTeam.findMany({ where: { queueMasterId }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
@@ -291,10 +292,10 @@ async function snapshotWithSynergyTeams(snapshot: CloudSnapshotV2): Promise<Clou
   return { ...snapshot, synergyTeams: teams.map((team) => ({ id: team.id, queuePlayerIds: team.queuePlayerIds as [string, string], createdAt: team.createdAt.toISOString(), version: team.version })) };
 }
 function challengeInput(player: any, teamsByPlayer = new Map<string, SynergyTeamRecord>(), queuePlayersById = new Map<string, any>()): MatchPlayer { const view = queuePlayerView(player, 0, teamsByPlayer, queuePlayersById); return { id: view.id, displayName: view.displayName, gender: view.gender, skillWeight: view.skillWeight, skillLevel: view.skillLevel, status: view.status, gamesPlayed: view.matchesPlayed, wins: view.wins, losses: view.losses, queueEnteredAt: view.queueEnteredAt, lastMatchEndedAt: view.lastMatchEndedAt, manualPriority: view.manualPriority, latePenaltyState: view.latePenaltyState, latePenaltyAppliedAt: view.latePenaltyAppliedAt, synergyTeamId: view.synergyTeamId ?? undefined, effectiveSkillWeight: view.effectiveSkillWeight, effectiveSkillLevel: view.effectiveSkillLevel }; }
-function undefeatedChallengeStatus(players: any[], minimumRestMinutes: number, teamsByPlayer = new Map<string, SynergyTeamRecord>()) {
+function undefeatedChallengeStatus(players: any[], minimumRestMinutes: number, teamsByPlayer = new Map<string, SynergyTeamRecord>(), reference = Date.now()) {
   const queuePlayersById = new Map<string, any>(players.map((player: any) => [player.id, player] as [string, any]));
   const ranked = undefeatedChallengePlayers(players.map((player) => challengeInput(player, teamsByPlayer, queuePlayersById)));
-  const now = Date.now();
+  const now = reference;
   return {
     minimumMatches: UNDEFEATED_CHALLENGE_MINIMUM_MATCHES,
     rankLimit: UNDEFEATED_CHALLENGE_RANK_LIMIT,
@@ -305,8 +306,8 @@ function undefeatedChallengeStatus(players: any[], minimumRestMinutes: number, t
     }),
   };
 }
-function guidedAvailabilityStatus(players: MatchPlayer[], minimumRestMinutes: number, synergyTeams: SynergyTeamRecord[] = []) {
-  return evaluateGuidedAvailability(players, { minimumRestMinutes, now: new Date(), synergyTeams: synergyTeams.map((team) => ({ id: team.id, queuePlayerIds: team.queuePlayerIds as [string, string], createdAt: team.createdAt.toISOString(), version: team.version })) });
+function guidedAvailabilityStatus(players: MatchPlayer[], minimumRestMinutes: number, synergyTeams: SynergyTeamRecord[] = [], reference = Date.now()) {
+  return evaluateGuidedAvailability(players, { minimumRestMinutes, now: new Date(reference), synergyTeams: synergyTeams.map((team) => ({ id: team.id, queuePlayerIds: team.queuePlayerIds as [string, string], createdAt: team.createdAt.toISOString(), version: team.version })) });
 }
 function undefeatedChallengeNotificationEvents(before: MatchPlayer[], after: MatchPlayer[]) {
   const previous = new Set(undefeatedChallengePlayers(before).map(({ player }) => player.id));
@@ -734,7 +735,7 @@ api.post("/queue/players/:id/rest", requireAuth, requireMutationOrigin, route(as
 api.post("/queue/players/:id/resume", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (player.status !== QueuePlayerStatus.RESTING) throw conflict("INVALID_PLAYER_TRANSITION", "Only resting players can resume."); const updated = await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.WAITING, restStartedAt: null, queueEnteredAt: new Date(), version: { increment: 1 } } }); await bumpMatchmakingRevision(authUser(request).id); responseData(response, queuePlayerView(updated)); }));
 api.post("/queue/players/:id/check-out", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); if (![QueuePlayerStatus.INACTIVE, QueuePlayerStatus.WAITING, QueuePlayerStatus.RESTING].includes(player.status)) throw conflict("PLAYER_BUSY", "Busy players cannot be checked out."); const updated = await db.queuePlayer.update({ where: { id: player.id }, data: { status: QueuePlayerStatus.CHECKED_OUT, checkedOutAt: new Date(), queueEnteredAt: null, version: { increment: 1 } } }); await bumpMatchmakingRevision(authUser(request).id); responseData(response, queuePlayerView(updated)); }));
 api.post("/queue/players/:id/late-penalty/waive", requireAuth, requireMutationOrigin, route(async (request, response) => { const player = await ownedQueuePlayer(request, request.params.id); assertVersion(player.version, versionFrom(request)); if (player.latePenaltyState !== LatePenaltyState.PENDING) { responseData(response, queuePlayerView(player)); return; } const updated = await db.$transaction(async (tx: any) => { const next = await tx.queuePlayer.update({ where: { id: player.id }, data: { latePenaltyState: LatePenaltyState.WAIVED, version: { increment: 1 } } }); await tx.queueWorkspace.update({ where: { queueMasterId: authUser(request).id }, data: { matchmakingRevision: { increment: 1 }, version: { increment: 1 } } }); await audit(tx, request, { action: "LATE_PENALTY_WAIVED", entityType: "QUEUE_PLAYER", entityId: player.id, reason: "Late-arrival penalty waived" }); return next; }); responseData(response, queuePlayerView(updated)); }));
-api.get("/queue", requireAuth, route(async (request, response) => { const workspace = await workspaceFor(request); const settings = (await ensureWorkspace(authUser(request).id)).settings; const players = await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id }, orderBy: [{ status: "asc" }, { queueEnteredAt: "asc" }] }); const teams = await loadSynergyTeams(authUser(request).id); const teamMap = synergyTeamMap(teams); const byId = new Map<string, any>(players.map((player: any) => [player.id, player] as [string, any])); const view = (player: any) => queuePlayerView(player, settings.minimumRestMinutes, teamMap, byId); const matchmakingPlayers = players.map((player: any) => challengeInput(player, teamMap, byId)); responseData(response, { serverTime: new Date(), minimumRestMinutes: settings.minimumRestMinutes, lateArrivalCutoffAt: workspace.lateArrivalCutoffAt, synergyTeams: teams.map((team) => synergyTeamView(team, byId)), undefeatedChallenge: undefeatedChallengeStatus(players, settings.minimumRestMinutes, teamMap), guided: guidedAvailabilityStatus(matchmakingPlayers, settings.minimumRestMinutes, teams), inactive: players.filter((p: any) => p.status === QueuePlayerStatus.INACTIVE || p.status === QueuePlayerStatus.CHECKED_OUT).map(view), waiting: players.filter((p: any) => p.status === QueuePlayerStatus.WAITING).map(view), queued: players.filter((p: any) => p.status === QueuePlayerStatus.QUEUED).map(view), playing: players.filter((p: any) => p.status === QueuePlayerStatus.PLAYING).map(view), resting: players.filter((p: any) => p.status === QueuePlayerStatus.RESTING).map(view) }); }));
+ api.get("/queue", requireAuth, route(async (request, response) => { const workspace = await workspaceFor(request); const settings = (await ensureWorkspace(authUser(request).id)).settings; const players = await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id }, orderBy: [{ status: "asc" }, { queueEnteredAt: "asc" }] }); const teams = await loadSynergyTeams(authUser(request).id); const teamMap = synergyTeamMap(teams); const byId = new Map<string, any>(players.map((player: any) => [player.id, player] as [string, any])); const reference = Date.now(); const view = (player: any) => queuePlayerView(player, settings.minimumRestMinutes, teamMap, byId, reference); const matchmakingPlayers = players.map((player: any) => challengeInput(player, teamMap, byId)); responseData(response, { serverTime: new Date(reference), minimumRestMinutes: settings.minimumRestMinutes, lateArrivalCutoffAt: workspace.lateArrivalCutoffAt, synergyTeams: teams.map((team) => synergyTeamView(team, byId)), undefeatedChallenge: undefeatedChallengeStatus(players, settings.minimumRestMinutes, teamMap, reference), guided: guidedAvailabilityStatus(matchmakingPlayers, settings.minimumRestMinutes, teams, reference), inactive: players.filter((p: any) => p.status === QueuePlayerStatus.INACTIVE || p.status === QueuePlayerStatus.CHECKED_OUT).map(view), waiting: players.filter((p: any) => p.status === QueuePlayerStatus.WAITING).map(view), queued: players.filter((p: any) => p.status === QueuePlayerStatus.QUEUED).map(view), playing: players.filter((p: any) => p.status === QueuePlayerStatus.PLAYING).map(view), resting: players.filter((p: any) => p.status === QueuePlayerStatus.RESTING).map(view) }); }));
 
 api.get("/courts", requireAuth, route(async (request, response) => { responseData(response, (await db.court.findMany({ where: { queueMasterId: authUser(request).id }, orderBy: { displayOrder: "asc" } })).map(courtView)); }));
 api.post("/courts", requireAuth, requireMutationOrigin, route(async (request, response) => { const body = parse(z.object({ name: courtNameSchema }), request.body); const last = await db.court.findFirst({ where: { queueMasterId: authUser(request).id }, orderBy: { displayOrder: "desc" }, select: { displayOrder: true } }); const name = body.name; const court = await db.court.create({ data: { queueMasterId: authUser(request).id, name, normalizedName: normalizeName(name), displayOrder: (last?.displayOrder ?? -1) + 1 } }); responseData(response, courtView(court), 201); }));
@@ -1161,8 +1162,104 @@ api.get("/admin/accounts/:id/deletion-preview", requireAuth, requireSuperAdmin, 
 api.delete("/admin/accounts/:id", requireAuth, requireSuperAdmin, requireMutationOrigin, route(async (request, response) => { const current = await db.queueMaster.findUnique({ where: { id: request.params.id } }); if (!current) throw notFound("Account not found."); assertVersion(current.version, versionFrom(request)); const body = parse(z.object({ confirmationUsername: z.string(), currentPassword: z.string() }), request.body); if (body.confirmationUsername !== current.username || !(await verifyPassword(authUser(request).passwordHash, body.currentPassword).catch(() => false))) throw forbidden("The confirmation details are invalid."); await withTransactionRetry(async (tx) => { await tx.matchGame.deleteMany({ where: { scoreRevision: { match: { queueMasterId: current.id } } } }); await tx.matchScoreRevision.deleteMany({ where: { match: { queueMasterId: current.id } } }); await tx.matchParticipant.deleteMany({ where: { match: { queueMasterId: current.id } } }); await tx.match.deleteMany({ where: { queueMasterId: current.id } }); await tx.payment.deleteMany({ where: { queueMasterId: current.id } }); await tx.synergyTeam.deleteMany({ where: { queueMasterId: current.id } }); await tx.queuePlayer.deleteMany({ where: { queueMasterId: current.id } }); await tx.court.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueFeeConfig.deleteMany({ where: { queueMasterId: current.id } }); await tx.publicRankingPublication.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueWorkspace.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueMasterSettings.deleteMany({ where: { queueMasterId: current.id } }); await tx.auditLog.deleteMany({ where: { queueMasterId: current.id } }); await tx.idempotencyRecord.deleteMany({ where: { queueMasterId: current.id } }); await tx.authSession.deleteMany({ where: { queueMasterId: current.id } }); await tx.player.deleteMany({ where: { queueMasterId: current.id } }); await tx.accountSyncState.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueMaster.delete({ where: { id: current.id } }); }); noContent(response); }));
 
 export function createApp() { const app = express(); app.set("trust proxy", config.trustProxyHops); app.use(helmet()); app.use(cors({ credentials: true, origin: (origin, callback) => { if (!origin || config.frontendOrigins.includes(origin)) callback(null, true); else callback(null, false); } })); app.use(express.json({ limit: "25mb" })); app.use(cookieParser()); app.use((pinoHttp as unknown as (options: unknown) => RequestHandler)({ logger, genReqId: () => randomUUID() })); app.use((request, response, next) => { response.locals.requestId = request.id; next(); }); app.get("/health", (_request, response) => response.json({ ok: true })); app.use("/api/v1", (_request, response) => response.status(426).json({ error: { code: "UPGRADE_REQUIRED", message: "This client must be upgraded to the current queue API." } })); app.use("/api/v2", rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: "draft-8", legacyHeaders: false }), api); app.use((_request, _response, next) => next(notFound("Route not found."))); app.use(errorHandler); return app; }
-api.post("/matches/:id/correct", requireAuth, requireMutationOrigin, route(async (request, response) => { const body = parse(z.object({ games: z.array(z.object({ teamAScore: z.number().int(), teamBScore: z.number().int() })).min(1).max(3), reason: z.string().min(1).max(500).optional() }), request.body); const match = await ownedMatch(request, request.params.id, true); const beforeChallengePlayers = await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id } }); if (match.status !== MatchStatus.COMPLETED) throw conflict("MATCH_NOT_COMPLETED", "Only completed matches can be corrected."); const validated = validateScores(body.games as ScoreInput[], scoreSettings(match)); const winnerTeam = validated.filter((game) => game.winnerTeam === TeamSide.A).length > validated.length / 2 ? TeamSide.A : TeamSide.B; const result = await withTransactionRetry(async (tx: any) => { const revision = await tx.matchScoreRevision.create({ data: { matchId: match.id, revisionNumber: (match.scoreRevisions?.[0]?.revisionNumber ?? 0) + 1, winnerTeam, reason: body.reason ?? "Score correction", createdByQueueMasterId: authUser(request).id, supersedesRevisionId: match.currentRevisionId, games: { create: validated.map((game, index) => ({ gameNumber: index + 1, teamAScore: game.teamAScore, teamBScore: game.teamBScore, winnerTeam: game.winnerTeam })) } }, include: { games: true } }); await tx.match.update({ where: { id: match.id }, data: { winnerTeam, currentRevisionId: revision.id, version: { increment: 1 } } }); const completed = await tx.match.findMany({ where: { queueMasterId: authUser(request).id, status: MatchStatus.COMPLETED }, include: { participants: true, scoreRevisions: { include: { games: true } } } }); await tx.queuePlayer.updateMany({ where: { queueMasterId: authUser(request).id }, data: { matchesPlayed: 0, wins: 0, losses: 0, pointsFor: 0, pointsAgainst: 0 } }); for (const item of completed) { const current = item.scoreRevisions.find((revision: any) => revision.id === item.currentRevisionId); if (!current) continue; const points = current.games.reduce((sum: any, game: any) => ({ a: sum.a + game.teamAScore, b: sum.b + game.teamBScore }), { a: 0, b: 0 }); for (const participant of item.participants) { const won = participant.team === current.winnerTeam; await tx.queuePlayer.update({ where: { id: participant.queuePlayerId }, data: { matchesPlayed: { increment: 1 }, wins: { increment: won ? 1 : 0 }, losses: { increment: won ? 0 : 1 }, pointsFor: { increment: participant.team === TeamSide.A ? points.a : points.b }, pointsAgainst: { increment: participant.team === TeamSide.A ? points.b : points.a } } }); } } await audit(tx, request, { action: "MATCH_SCORE_CORRECTED", entityType: "MATCH", entityId: match.id, reason: body.reason ?? "Score correction" }); await bumpMatchmakingRevision(authUser(request).id, tx); return tx.match.findUnique({ where: { id: match.id }, include: { participants: { include: { queuePlayer: true } }, court: true, scoreRevisions: { include: { games: true }, orderBy: { revisionNumber: "desc" } } } }); }); const afterChallengePlayers = await db.queuePlayer.findMany({ where: { queueMasterId: authUser(request).id } }); responseData(response, { ...matchView(result), notifications: undefeatedChallengeNotificationEvents(beforeChallengePlayers.map(challengeInput), afterChallengePlayers.map(challengeInput)) }); }));
+api.post("/matches/:id/correct", requireAuth, requireMutationOrigin, route(async (request, response) => {
+  const body = parse(z.object({ games: z.array(z.object({ teamAScore: z.number().int(), teamBScore: z.number().int() })).min(1).max(3), reason: z.string().trim().min(1).max(500).optional() }), request.body);
+  const match = await ownedMatch(request, request.params.id, true);
+  const expected = versionFrom(request);
+  if (request.get("if-match") !== undefined && expected === undefined) throw conflict("VERSION_REQUIRED", "The current match version is required.");
+  if (expected !== undefined) assertVersion(match.version, expected);
+  if (match.status !== MatchStatus.COMPLETED) throw conflict("MATCH_NOT_COMPLETED", "Only completed matches can be corrected.");
+  const validated = validateScores(body.games as ScoreInput[], scoreSettings(match));
+  const previous = match.scoreRevisions.find((revision: any) => revision.id === match.currentRevisionId) ?? [...(match.scoreRevisions ?? [])].sort((a: any, b: any) => b.revisionNumber - a.revisionNumber)[0];
+  if (previous && previous.games.length === validated.length && previous.games.every((game: any, index: number) => game.teamAScore === validated[index]?.teamAScore && game.teamBScore === validated[index]?.teamBScore)) throw badRequest("Enter a different score before saving a correction.");
+  const winnerTeam = validated.filter((game) => game.winnerTeam === TeamSide.A).length > validated.length / 2 ? TeamSide.A : TeamSide.B;
+  const queueMasterId = authUser(request).id;
+  const beforeChallengePlayers = await db.queuePlayer.findMany({ where: { queueMasterId } });
+  const result = await withTransactionRetry(async (tx: any) => {
+    const revision = await tx.matchScoreRevision.create({ data: { matchId: match.id, revisionNumber: (previous?.revisionNumber ?? 0) + 1, winnerTeam, reason: body.reason ?? "Score correction", createdByQueueMasterId: queueMasterId, supersedesRevisionId: match.currentRevisionId, games: { create: validated.map((game, index) => ({ gameNumber: index + 1, teamAScore: game.teamAScore, teamBScore: game.teamBScore, winnerTeam: game.winnerTeam })) } }, include: { games: true } });
+    const claimed = expected === undefined ? await tx.match.updateMany({ where: { id: match.id, queueMasterId, status: MatchStatus.COMPLETED }, data: { winnerTeam, currentRevisionId: revision.id, version: { increment: 1 } } }) : await tx.match.updateMany({ where: { id: match.id, queueMasterId, status: MatchStatus.COMPLETED, version: expected }, data: { winnerTeam, currentRevisionId: revision.id, version: { increment: 1 } } });
+    if (claimed.count !== 1) throw conflict("VERSION_CONFLICT", "The match changed on another device.");
+    await rebuildCompletedMatchStats(tx, queueMasterId);
+    await audit(tx, request, { action: "MATCH_SCORE_CORRECTED", entityType: "MATCH", entityId: match.id, reason: body.reason ?? "Score correction", before: { winnerTeam: match.winnerTeam, scoreRevisionId: match.currentRevisionId, games: previous?.games ?? [] }, after: { winnerTeam, scoreRevisionId: revision.id, games: validated } });
+    return tx.match.findUnique({ where: { id: match.id }, include: { participants: { include: { queuePlayer: true } }, court: true, scoreRevisions: { include: { games: true }, orderBy: { revisionNumber: "desc" } } } });
+  });
+  const afterChallengePlayers = await db.queuePlayer.findMany({ where: { queueMasterId } });
+  responseData(response, { ...matchView(result), notifications: undefeatedChallengeNotificationEvents(beforeChallengePlayers.map(challengeInput), afterChallengePlayers.map(challengeInput)) });
+}));
+
+api.post("/matches/:id/correct-participants", requireAuth, requireMutationOrigin, route(async (request, response) => {
+  const body = parse(z.object({ teamA: z.array(idSchema), teamB: z.array(idSchema), reason: z.string().trim().min(1).max(500).optional() }), request.body);
+  const queueMasterId = authUser(request).id;
+  const match = await ownedMatch(request, request.params.id, true);
+  const expected = versionFrom(request);
+  if (request.get("if-match") !== undefined && expected === undefined) throw conflict("VERSION_REQUIRED", "The current match version is required.");
+  if (expected !== undefined) assertVersion(match.version, expected);
+  if (match.status !== MatchStatus.COMPLETED) throw conflict("MATCH_NOT_COMPLETED", "Only completed matches can be corrected.");
+  const originalA = match.participants.filter((item: any) => item.team === TeamSide.A).sort((a: any, b: any) => a.teamSlot - b.teamSlot).map((item: any) => item.queuePlayerId);
+  const originalB = match.participants.filter((item: any) => item.team === TeamSide.B).sort((a: any, b: any) => a.teamSlot - b.teamSlot).map((item: any) => item.queuePlayerId);
+  if (body.teamA.length !== originalA.length || body.teamB.length !== originalB.length) throw badRequest("The correction must preserve the original singles or doubles format.");
+  const ids = [...body.teamA, ...body.teamB];
+  if (new Set(ids).size !== ids.length) throw badRequest("Choose each player only once.");
+  if (body.teamA.join(",") === originalA.join(",") && body.teamB.join(",") === originalB.join(",")) throw badRequest("Choose a different lineup before saving a correction.");
+  const beforeChallengePlayers = await db.queuePlayer.findMany({ where: { queueMasterId } });
+  const result = await withTransactionRetry(async (tx: any) => {
+    const players = await tx.queuePlayer.findMany({ where: { id: { in: ids }, queueMasterId } });
+    if (players.length !== ids.length) throw notFound("One or more selected players were not found in this queue.");
+    const claimed = expected === undefined ? await tx.match.updateMany({ where: { id: match.id, queueMasterId, status: MatchStatus.COMPLETED }, data: { version: { increment: 1 } } }) : await tx.match.updateMany({ where: { id: match.id, queueMasterId, status: MatchStatus.COMPLETED, version: expected }, data: { version: { increment: 1 } } });
+    if (claimed.count !== 1) throw conflict("VERSION_CONFLICT", "The match changed on another device.");
+    const priorQueueEnteredAt = new Map(match.participants.map((participant: any) => [participant.queuePlayerId, participant.priorQueueEnteredAt ?? null]));
+    await tx.matchParticipant.deleteMany({ where: { matchId: match.id } });
+    await tx.matchParticipant.createMany({ data: ids.map((queuePlayerId) => ({ matchId: match.id, queuePlayerId, team: body.teamA.includes(queuePlayerId) ? TeamSide.A : TeamSide.B, teamSlot: body.teamA.includes(queuePlayerId) ? body.teamA.indexOf(queuePlayerId) + 1 : body.teamB.indexOf(queuePlayerId) + 1, priorQueueEnteredAt: priorQueueEnteredAt.has(queuePlayerId) ? priorQueueEnteredAt.get(queuePlayerId) : players.find((player: any) => player.id === queuePlayerId)?.queueEnteredAt ?? null })) });
+    await rebuildCompletedMatchStats(tx, queueMasterId);
+    await audit(tx, request, { action: "MATCH_PARTICIPANTS_CORRECTED", entityType: "MATCH", entityId: match.id, reason: body.reason ?? "Participant correction", before: { teamA: originalA, teamB: originalB }, after: { teamA: body.teamA, teamB: body.teamB } });
+    return tx.match.findUnique({ where: { id: match.id }, include: { participants: { include: { queuePlayer: true } }, court: true, scoreRevisions: { include: { games: true }, orderBy: { revisionNumber: "desc" } } } });
+  });
+  const afterChallengePlayers = await db.queuePlayer.findMany({ where: { queueMasterId } });
+  responseData(response, { ...matchView(result), notifications: undefeatedChallengeNotificationEvents(beforeChallengePlayers.map(challengeInput), afterChallengePlayers.map(challengeInput)) });
+}));
 api.get("/history", requireAuth, route(async (request, response) => { const query = parse(historyQuerySchema, request.query); const matches = await matchHistoryFor(authUser(request).id); const search = query.search.toLowerCase(); const rows = matches.map((match: any) => historyMatchView(match)).filter((match: any) => !search || match.participants.some((p: any) => String(p.displayName).toLowerCase().includes(search))); responseData(response, pageResult(rows, query.page, query.pageSize)); }));
+
+async function rebuildCompletedMatchStats(tx: any, queueMasterId: string) {
+  const [completed, roster, workspace, currentConfig] = await Promise.all([
+    tx.match.findMany({ where: { queueMasterId, status: MatchStatus.COMPLETED }, include: { participants: true, scoreRevisions: { include: { games: true } } } }),
+    tx.queuePlayer.findMany({ where: { queueMasterId }, select: { id: true } }),
+    tx.queueWorkspace.findUnique({ where: { queueMasterId } }),
+    tx.queueFeeConfig.findUnique({ where: { queueMasterId } }),
+  ]);
+  const stats = new Map<string, { matchesPlayed: number; wins: number; losses: number; pointsFor: number; pointsAgainst: number; lastMatchEndedAt: Date | null }>();
+  for (const player of roster) stats.set(player.id, { matchesPlayed: 0, wins: 0, losses: 0, pointsFor: 0, pointsAgainst: 0, lastMatchEndedAt: null });
+  for (const match of completed) {
+    const revision = match.scoreRevisions.find((item: any) => item.id === match.currentRevisionId) ?? [...match.scoreRevisions].sort((a: any, b: any) => b.revisionNumber - a.revisionNumber)[0];
+    if (!revision) continue;
+    const points = revision.games.reduce((sum: { a: number; b: number }, game: any) => ({ a: sum.a + game.teamAScore, b: sum.b + game.teamBScore }), { a: 0, b: 0 });
+    for (const participant of match.participants) {
+      const stat = stats.get(participant.queuePlayerId);
+      if (!stat) continue;
+      const won = participant.team === revision.winnerTeam;
+      stat.matchesPlayed += 1;
+      stat.wins += won ? 1 : 0;
+      stat.losses += won ? 0 : 1;
+      stat.pointsFor += participant.team === TeamSide.A ? points.a : points.b;
+      stat.pointsAgainst += participant.team === TeamSide.A ? points.b : points.a;
+      if (match.completedAt && (!stat.lastMatchEndedAt || match.completedAt > stat.lastMatchEndedAt)) stat.lastMatchEndedAt = match.completedAt;
+    }
+  }
+  const feeUpdates = new Map<string, number>();
+  if (workspace?.endedAt && currentConfig) {
+    const allocations = allocateFinalFeeAmounts(currentConfig, roster.map((player: any) => ({ id: player.id, matchesPlayed: stats.get(player.id)?.matchesPlayed ?? 0 })));
+    allocations.forEach((amount, id) => feeUpdates.set(id, amount));
+  }
+  await Promise.all(roster.map((player: any) => {
+    const stat = stats.get(player.id)!;
+    return tx.queuePlayer.update({ where: { id: player.id }, data: { ...stat, ...(feeUpdates.has(player.id) ? { amountDueMinor: feeUpdates.get(player.id) } : {}), version: { increment: 1 } } });
+  }));
+  if (workspace?.endedAt && currentConfig) await tx.queueFeeConfig.update({ where: { id: currentConfig.id }, data: { version: { increment: 1 } } });
+  await bumpMatchmakingRevision(queueMasterId, tx);
+  if (workspace?.endedAt) {
+    const publication = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: workspace.startedAt, finalizedAt: { not: null } } });
+    if (publication) await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { finalSnapshot: await publicRankingSnapshot(queueMasterId, publication.id, publication.finalizedAt, tx), version: { increment: 1 } } });
+  }
+}
 api.post("/workspace/end", requireAuth, requireMutationOrigin, route(async (request, response) => {
   const queueMasterId = authUser(request).id;
   const expected = versionFrom(request);

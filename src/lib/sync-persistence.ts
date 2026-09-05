@@ -18,6 +18,14 @@ async function finalizePublicRankingFromSnapshot(tx: SyncDatabase, queueMasterId
   await tx.auditLog.create({ data: { queueMasterId, action: "PUBLIC_RANKINGS_FINALIZED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Public rankings finalized during offline synchronization", beforeJson: { sessionStartedAt }, afterJson: { sessionEndedAt: sessionEndedAt.toISOString() }, requestId: `offline:sync:${sessionEndedAt.getTime()}` } });
 }
 
+async function refreshFinalizedPublicRankingFromSnapshot(tx: SyncDatabase, queueMasterId: string, sessionStartedAt: string, snapshot: CloudSnapshotV2) {
+  if (!tx.publicRankingPublication?.findFirst || !snapshot.workspace.endedAt) return;
+  const publication = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: new Date(sessionStartedAt), finalizedAt: { not: null } } });
+  if (!publication) return;
+  await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { finalSnapshot: publicRankingSnapshotFromCloudSnapshot(snapshot, publication.id, publication.finalizedAt), version: { increment: 1 } } });
+  await tx.auditLog.create({ data: { queueMasterId, action: "PUBLIC_RANKINGS_UPDATED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Finalized public rankings refreshed after offline match correction", beforeJson: { finalizedAt: publication.finalizedAt.toISOString() }, afterJson: { finalizedAt: publication.finalizedAt.toISOString() }, requestId: `offline:sync:refresh:${Date.now()}` } });
+}
+
 export type SyncUpload = {
   schemaVersion: 2 | 3;
   deviceId: string;
@@ -243,6 +251,7 @@ export async function persistSyncSnapshot(tx: SyncDatabase, upload: SyncUpload, 
       await finalizePublicRankingFromSnapshot(tx, queueMasterId, currentStartedAt, endedAt, finalSnapshot);
     }
     await reconcileSyncSnapshot(tx, queueMasterId, merged.snapshot, upload.auditEvents, upload.operationId);
+    if (!sessionChanged && merged.snapshot.workspace.endedAt) await refreshFinalizedPublicRankingFromSnapshot(tx, queueMasterId, mergedStartedAt, merged.snapshot);
     const updated = await tx.accountSyncState.findUnique({ where: { id: state.id } });
     if (!updated) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the snapshot was being saved.");
     if (receipts?.create) await receipts.create({ data: { queueMasterId, operationId: upload.operationId, deviceId: upload.deviceId, cloudRevision: updated.cloudRevision } });
@@ -277,6 +286,7 @@ export async function persistSyncSnapshot(tx: SyncDatabase, upload: SyncUpload, 
     await finalizePublicRankingFromSnapshot(tx, queueMasterId, current.snapshot.workspace.startedAt, endedAt, finalSnapshot);
   }
   await reconcileSyncSnapshot(tx, queueMasterId, upload.snapshot, upload.auditEvents, upload.operationId);
+  if (!sessionChanged && upload.snapshot.workspace.endedAt) await refreshFinalizedPublicRankingFromSnapshot(tx, queueMasterId, upload.snapshot.workspace.startedAt, upload.snapshot);
   const updated = await tx.accountSyncState.findUnique({ where: { id: state.id } });
   if (!updated) throw conflict("SYNC_CLOUD_CHANGED", "The sync state changed while the snapshot was being saved.");
   return { state: updated, alreadyApplied: false };
