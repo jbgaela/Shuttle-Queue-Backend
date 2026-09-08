@@ -3,7 +3,7 @@ import test from "node:test";
 import { Gender, MatchmakingMode, QueuePlayerStatus, TeamSide } from "@prisma/client";
 import { allocateEqualSplit, collectionTotalsByPlayer } from "../../src/lib/fees.js";
 import { allowedQueueStatuses, queueActionData } from "../../src/lib/queue-actions.js";
-import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView, playerHistoryStats } from "../../src/lib/history.js";
+import { chooseFrequentParticipant, historyDurationSeconds, historyMatchView, matchProvenance, matchSourceAfterLineupEdit, playerHistoryStats } from "../../src/lib/history.js";
 import { isGuidedMatchAvailable, isProhibitedGeneratedGenderMatch, isProhibitedGeneratedNewbieMatch, suggestMatch, undefeatedChallengePlayers, validateBalancedLineup, validateGuidedLineup, validateMixedDoublesLineup, type MatchPlayer } from "../../src/lib/matchmaking.js";
 import { validateScores } from "../../src/lib/score.js";
 import { datePartsForInstant, inclusiveMinuteCutoff, instantForLocalDateTime } from "../../src/lib/timezone.js";
@@ -334,7 +334,38 @@ test("history formatting uses the current score revision and calculates duration
   assert.equal(result.winnerTeam, "B");
   assert.equal(result.score?.revisionNumber, 2);
   assert.equal(result.score?.games[0]?.teamBScore, 31);
+  assert.equal(result.provenance.kind, "MANUAL");
+  assert.equal(result.provenance.label, "Manual");
   assert.equal(historyDurationSeconds({ startedAt, completedAt: null }), null);
+});
+
+test("history provenance distinguishes adjusted generated suggestions", () => {
+  const retained = matchProvenance({ source: "MANUAL_ADJUSTED", matchmakingMode: "OPEN", suggestionExplanation: { generatedOrigin: "SUGGESTION", originalMode: "OPEN" } }, "Open");
+  assert.deepEqual(retained, {
+    kind: "ADJUSTED_SUGGESTION",
+    label: "Open · Adjusted",
+    description: "Started as a Open suggestion. The lineup was edited and still meets Open rules.",
+    originalMode: "OPEN",
+    guaranteesRetained: true,
+  });
+  const converted = matchProvenance({ source: "MANUAL_ADJUSTED", matchmakingMode: null, suggestionExplanation: { generatedOrigin: "SUGGESTION", originalMode: "BALANCED" } }, null);
+  assert.equal(converted.kind, "ADJUSTED_SUGGESTION");
+  assert.equal(converted.label, "Adjusted suggestion");
+  assert.equal(converted.guaranteesRetained, false);
+  assert.match(converted.description, /original mode guarantees no longer apply/);
+});
+
+test("history provenance safely labels old adjusted records without suggestion metadata", () => {
+  const result = matchProvenance({ source: "MANUAL_ADJUSTED", matchmakingMode: null, suggestionExplanation: null }, null);
+  assert.equal(result.kind, "LEGACY_ADJUSTED");
+  assert.equal(result.label, "Adjusted lineup");
+});
+
+test("lineup edits preserve manual origin and classify generated origin as adjusted", () => {
+  assert.equal(matchSourceAfterLineupEdit("MANUAL", true), "MANUAL");
+  assert.equal(matchSourceAfterLineupEdit("AUTOMATIC", true), "MANUAL_ADJUSTED");
+  assert.equal(matchSourceAfterLineupEdit("MANUAL_ADJUSTED", true), "MANUAL_ADJUSTED");
+  assert.equal(matchSourceAfterLineupEdit("AUTOMATIC", false), "AUTOMATIC");
 });
 
 test("history formatting preserves a deleted court snapshot", () => {

@@ -9,7 +9,7 @@ import pinoHttpModule from "pino-http";
 import { Prisma, AccountRole, Gender, LatePenaltyState, MatchStatus, MatchSource, MatchmakingMode, PaymentKind, PaymentMethod, PlayerStatus, QueueMasterStatus, QueuePlayerStatus, TeamSide, CourtStatus, FeeMode, SkillLevel } from "@prisma/client";
 import { z } from "zod";
 import { prisma, withTransactionRetry } from "./lib/db.js";
-import { historyMatchView, playerHistoryStats } from "./lib/history.js";
+import { historyMatchView, matchSourceAfterLineupEdit, playerHistoryStats } from "./lib/history.js";
 import { config } from "./lib/config.js";
 import { AppError, badRequest, conflict, forbidden, notFound, unauthorized } from "./lib/errors.js";
 import { normalizeName, normalizeText, normalizeUsername } from "./lib/normalize.js";
@@ -1316,7 +1316,8 @@ api.patch("/matches/:id", requireAuth, requireMutationOrigin, route(async (reque
     const originalIds = new Set(match.participants.map((participant: any) => participant.queuePlayerId));
     const originalTeamA = match.participants.filter((participant: any) => participant.team === TeamSide.A).sort((a: any, b: any) => a.teamSlot - b.teamSlot).map((participant: any) => participant.queuePlayerId);
     const originalTeamB = match.participants.filter((participant: any) => participant.team === TeamSide.B).sort((a: any, b: any) => a.teamSlot - b.teamSlot).map((participant: any) => participant.queuePlayerId);
-    if (body.overrideToManual && originalTeamA.join(",") === body.teamA.join(",") && originalTeamB.join(",") === body.teamB.join(",")) throw badRequest("Manual conversion requires an edited lineup.");
+    const lineupChanged = originalTeamA.join(",") !== body.teamA.join(",") || originalTeamB.join(",") !== body.teamB.join(",");
+    if (body.overrideToManual && !lineupChanged) throw badRequest("Manual conversion requires an edited lineup.");
     if (players.length !== ids.length || players.some((player: any) => match.status === MatchStatus.QUEUED
       ? ![QueuePlayerStatus.WAITING, QueuePlayerStatus.QUEUED, QueuePlayerStatus.PLAYING].includes(player.status)
       : originalIds.has(player.id) ? player.status !== QueuePlayerStatus.PLAYING : player.status !== QueuePlayerStatus.WAITING)) {
@@ -1366,22 +1367,31 @@ api.patch("/matches/:id", requireAuth, requireMutationOrigin, route(async (reque
         const sourceCourtUpdated = await tx.court.updateMany({ where: { id: currentCourt.id, queueMasterId, status: CourtStatus.OCCUPIED, currentMatchId: match.id }, data: { currentMatchId: swappedMatch.id, version: { increment: 1 } } });
         const targetCourtUpdated = await tx.court.updateMany({ where: { id: targetCourt.id, queueMasterId, status: CourtStatus.OCCUPIED, currentMatchId: swappedMatch.id }, data: { currentMatchId: match.id, version: { increment: 1 } } });
         if (sourceCourtUpdated.count !== 1 || targetCourtUpdated.count !== 1) throw conflict("COURT_SWAP_STALE", "The selected court assignments changed. Refresh the live courts and try again.");
-        const swappedMatchUpdated = await tx.match.updateMany({ where: { id: swappedMatch.id, queueMasterId, status: MatchStatus.IN_PROGRESS, courtId: targetCourt.id, version: swappedMatch.version }, data: { courtId: currentCourt.id, courtIdSnapshot: currentCourt.id, courtNameSnapshot: currentCourt.name, source: MatchSource.MANUAL_ADJUSTED, suggestionKey: null, suggestionExplanation: { ...(swappedMatch.suggestionExplanation as any ?? {}), adjusted: true }, version: { increment: 1 } } });
+        const swappedMatchUpdated = await tx.match.updateMany({ where: { id: swappedMatch.id, queueMasterId, status: MatchStatus.IN_PROGRESS, courtId: targetCourt.id, version: swappedMatch.version }, data: { courtId: currentCourt.id, courtIdSnapshot: currentCourt.id, courtNameSnapshot: currentCourt.name, version: { increment: 1 } } });
         if (swappedMatchUpdated.count !== 1) throw conflict("COURT_SWAP_STALE", "The selected match changed. Refresh the live courts and try again.");
       }
     }
-    const priorById = new Map(match.participants.map((participant: any) => [participant.queuePlayerId, participant.priorQueueEnteredAt]));
-    await tx.matchParticipant.deleteMany({ where: { matchId: match.id } });
-    await tx.matchParticipant.createMany({ data: ids.map((queuePlayerId) => ({ matchId: match.id, queuePlayerId, team: body.teamA.includes(queuePlayerId) ? TeamSide.A : TeamSide.B, teamSlot: body.teamA.includes(queuePlayerId) ? body.teamA.indexOf(queuePlayerId) + 1 : body.teamB.indexOf(queuePlayerId) + 1, priorQueueEnteredAt: priorById.get(queuePlayerId) ?? players.find((player: any) => player.id === queuePlayerId)?.queueEnteredAt ?? null })) });
-    const affected = [...new Set([...match.participants.map((participant: any) => participant.queuePlayerId), ...ids])];
-    await reconcileQueuePlayers(tx, queueMasterId, affected);
+    if (lineupChanged) {
+      const priorById = new Map(match.participants.map((participant: any) => [participant.queuePlayerId, participant.priorQueueEnteredAt]));
+      await tx.matchParticipant.deleteMany({ where: { matchId: match.id } });
+      await tx.matchParticipant.createMany({ data: ids.map((queuePlayerId) => ({ matchId: match.id, queuePlayerId, team: body.teamA.includes(queuePlayerId) ? TeamSide.A : TeamSide.B, teamSlot: body.teamA.includes(queuePlayerId) ? body.teamA.indexOf(queuePlayerId) + 1 : body.teamB.indexOf(queuePlayerId) + 1, priorQueueEnteredAt: priorById.get(queuePlayerId) ?? players.find((player: any) => player.id === queuePlayerId)?.queueEnteredAt ?? null })) });
+      const affected = [...new Set([...match.participants.map((participant: any) => participant.queuePlayerId), ...ids])];
+      await reconcileQueuePlayers(tx, queueMasterId, affected);
+    }
     const previousExplanation = match.suggestionExplanation && typeof match.suggestionExplanation === "object" ? match.suggestionExplanation as Record<string, unknown> : null;
     const updatedAdvisory = lowSkillLoneFemaleAdvisory(teamAPlayers, teamBPlayers);
     const preservedMode = !body.overrideToManual && match.matchmakingMode !== null && match.matchmakingMode !== MatchmakingMode.UNDEFEATED_CHALLENGE ? match.matchmakingMode : null;
     const preservedGuided = preservedMode === MatchmakingMode.GUIDED;
     const guidedExplanation = preservedGuided ? { guided: buildGuidedExplanation([...teamAPlayers, ...teamBPlayers].map((player) => ({ id: player.id, skillLevel: player.skillLevel }))) } : {};
     const courtData = targetCourt ? { courtId: targetCourt.id, courtIdSnapshot: targetCourt.id, courtNameSnapshot: targetCourt.name } : {};
-    await tx.match.update({ where: { id: match.id, version: expected }, data: { ...courtData, source: MatchSource.MANUAL_ADJUSTED, matchmakingMode: preservedMode, algorithmVersion: preservedMode ? (match.algorithmVersion ?? MATCHMAKING_ALGORITHM) : null, suggestionKey: null, suggestionExplanation: previousExplanation || updatedAdvisory || preservedMode || body.overrideToManual ? { ...(previousExplanation ?? {}), ...(body.overrideToManual ? { originalMode: match.matchmakingMode, originalAlgorithmVersion: match.algorithmVersion, originalSuggestionKey: match.suggestionKey, overrideToManual: true, adjusted: true } : {}), ...(preservedMode ? { algorithmVersion: match.algorithmVersion ?? MATCHMAKING_ALGORITHM, adjusted: true } : {}), ...(preservedGuided ? guidedExplanation : {}), matchupAdvisory: updatedAdvisory } : null, version: { increment: 1 } } });
+    const nextSource = matchSourceAfterLineupEdit(match.source, lineupChanged) as MatchSource;
+    const generatedSuggestionOrigin = match.source === MatchSource.AUTOMATIC || previousExplanation?.generatedOrigin === "SUGGESTION" || typeof previousExplanation?.originalMode === "string";
+    const nextExplanation = !lineupChanged
+      ? previousExplanation
+      : previousExplanation || updatedAdvisory || preservedMode || body.overrideToManual || generatedSuggestionOrigin
+        ? { ...(previousExplanation ?? {}), ...(generatedSuggestionOrigin ? { generatedOrigin: "SUGGESTION", originalMode: previousExplanation?.originalMode ?? match.matchmakingMode } : {}), ...(lineupChanged && match.source !== MatchSource.MANUAL ? { adjusted: true } : {}), ...(body.overrideToManual ? { originalMode: match.matchmakingMode, originalAlgorithmVersion: match.algorithmVersion, originalSuggestionKey: match.suggestionKey, ...(generatedSuggestionOrigin ? { generatedOrigin: "SUGGESTION" } : {}), overrideToManual: true, adjusted: true } : {}), ...(preservedMode ? { algorithmVersion: match.algorithmVersion ?? MATCHMAKING_ALGORITHM, adjusted: true } : {}), ...(preservedGuided ? guidedExplanation : {}), ...(updatedAdvisory ? { matchupAdvisory: updatedAdvisory } : {}) }
+        : null;
+    await tx.match.update({ where: { id: match.id, version: expected }, data: { ...courtData, source: nextSource, matchmakingMode: lineupChanged ? preservedMode : match.matchmakingMode, algorithmVersion: lineupChanged ? (preservedMode ? (match.algorithmVersion ?? MATCHMAKING_ALGORITHM) : null) : match.algorithmVersion, suggestionKey: lineupChanged ? null : match.suggestionKey, suggestionExplanation: nextExplanation as Prisma.InputJsonValue | null, version: { increment: 1 } } });
     if (swappedMatch && currentCourt) await audit(tx, request, { action: "MATCH_UPDATED", entityType: "MATCH", entityId: swappedMatch.id, reason: "Live match court swapped by Queue Master", before: { courtId: swappedMatch.courtId }, after: { courtId: currentCourt.id, swappedWithMatchId: match.id } });
     await tx.queueWorkspace.update({ where: { queueMasterId }, data: { matchmakingRevision: { increment: 1 }, version: { increment: 1 } } });
     await audit(tx, request, { action: "MATCH_UPDATED", entityType: "MATCH", entityId: match.id, reason: match.status === MatchStatus.IN_PROGRESS ? "Live match edited by Queue Master" : "Queued lineup edited by Queue Master", before: { participants: match.participants, courtId: match.courtId }, after: { teamA: body.teamA, teamB: body.teamB, courtId: targetCourt?.id ?? match.courtId, swappedWithMatchId: swappedMatch?.id ?? null } });
