@@ -2,6 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { activePublicRankingWhere, earliestMatchStartedAt, isPublicRankingSnapshot, publicHistoryFromSnapshot, publicPlayerKey, publicRankingSnapshotFromCloudSnapshot, publicRankingSnapshotFromRecords, recalculatePublicRankingRows } from "../../src/lib/public-rankings.js";
 import { publicRankingRowsFromSnapshot } from "../../src/lib/sync-persistence.js";
+import { PRIZE_RANKING_METHOD, rankRecords } from "../../src/lib/prize-ranking.js";
+
+test("live rankings reserve the top ten while retaining three prize places", () => {
+  const rows = rankRecords([
+    { id: "provisional", displayNameSnapshot: "Provisional", matchesPlayed: 4, wins: 4, losses: 0, pointsFor: 84, pointsAgainst: 30 },
+    { id: "eligible", displayNameSnapshot: "Eligible", matchesPlayed: 5, wins: 0, losses: 5, pointsFor: 30, pointsAgainst: 105 },
+  ], "2026-08-30T10:00:00.000Z");
+  assert.deepEqual(rows.map(({ rank, eligible, isPrizePosition }) => ({ rank, eligible, isPrizePosition })), [
+    { rank: 1, eligible: true, isPrizePosition: true },
+    { rank: 11, eligible: false, isPrizePosition: false },
+  ]);
+  assert.equal(PRIZE_RANKING_METHOD.version, "wilson95-v3");
+  assert.equal(PRIZE_RANKING_METHOD.minimumMatches, 5);
+  assert.equal(PRIZE_RANKING_METHOD.prizePlaces, 3);
+});
 
 test("active public ranking filter includes null and missing revokedAt values", () => {
   assert.deepEqual(activePublicRankingWhere(), {
@@ -34,7 +49,7 @@ test("public ranking snapshots include every joined player and hide private fiel
     { id: "winner", displayName: "Winner", wins: 3, losses: 1, matchesPlayed: 4, pointsFor: 84, pointsAgainst: 70, gender: "MALE", skillLevel: "ADVANCED" },
   ] } as unknown as Parameters<typeof publicRankingRowsFromSnapshot>[0]);
   assert.deepEqual(rows.map(({ rank, playerKey, player, matchesPlayed, eligible, gamesNeeded, isPrizePosition }) => ({ rank, playerKey, player, matchesPlayed, eligible, gamesNeeded, isPrizePosition })), [
-    { rank: 1, playerKey: publicPlayerKey("queue", "winner"), player: "Winner", matchesPlayed: 4, eligible: false, gamesNeeded: 1, isPrizePosition: false },
+    { rank: 11, playerKey: publicPlayerKey("queue", "winner"), player: "Winner", matchesPlayed: 4, eligible: false, gamesNeeded: 1, isPrizePosition: false },
     { rank: null, playerKey: publicPlayerKey("queue", "zero"), player: "Zero", matchesPlayed: 0, eligible: false, gamesNeeded: 5, isPrizePosition: false },
   ]);
   assert.notEqual(rows[0]!.rankingScoreBasisPoints, null);
@@ -143,13 +158,35 @@ test("public rankings show provisional archived rows without granting prize posi
   const rows = recalculatePublicRankingRows([
     { playerKey: "perfect", player: "Perfect", matchesPlayed: 5, wins: 5, losses: 0, pointsFor: 105, pointsAgainst: 50 },
     { playerKey: "strong", player: "Strong", matchesPlayed: 10, wins: 9, losses: 1, pointsFor: 189, pointsAgainst: 120 },
-    { playerKey: "short", player: "Short", matchesPlayed: 4, wins: 4, losses: 0, pointsFor: 84, pointsAgainst: 30 },
+    { rank: 4, playerKey: "short", player: "Short", matchesPlayed: 4, wins: 4, losses: 0, pointsFor: 84, pointsAgainst: 30 },
   ], "2026-08-30T10:00:00.000Z");
   assert.equal(rows[0]!.player, "Strong");
   assert.equal(rows[0]!.isPrizePosition, true);
-  assert.equal(rows[2]!.rank, 3);
+  assert.equal(rows[1]!.player, "Perfect");
+  assert.equal(rows[1]!.isPrizePosition, true);
+  assert.equal(rows[2]!.rank, 11);
   assert.equal(rows[2]!.eligible, false);
   assert.equal(rows[2]!.gamesNeeded, 1);
   assert.notEqual(rows[2]!.rankingScoreBasisPoints, null);
   assert.equal(rows[2]!.isPrizePosition, false);
+});
+
+test("new public snapshots use the eligibility-first ranking order", () => {
+  const snapshot = publicRankingSnapshotFromRecords({
+    publicationId: "publication",
+    capturedAt: new Date("2026-08-30T10:00:00.000Z"),
+    sessionStartedAt: "2026-08-30T08:00:00.000Z",
+    rows: [
+      { id: "provisional", displayNameSnapshot: "Provisional", matchesPlayed: 4, wins: 4, losses: 0, pointsFor: 84, pointsAgainst: 30 },
+      { id: "eligible", displayNameSnapshot: "Eligible", matchesPlayed: 5, wins: 1, losses: 4, pointsFor: 30, pointsAgainst: 84 },
+    ],
+    matches: [],
+  });
+  assert.equal(snapshot.rankingMethod.version, "wilson95-v3");
+  assert.equal(snapshot.schemaVersion, 4);
+  assert.equal(isPublicRankingSnapshot(snapshot), true);
+  assert.deepEqual(snapshot.rankings.map(({ player, rank, eligible, isPrizePosition }) => ({ player, rank, eligible, isPrizePosition })), [
+    { player: "Eligible", rank: 1, eligible: true, isPrizePosition: true },
+    { player: "Provisional", rank: 11, eligible: false, isPrizePosition: false },
+  ]);
 });
