@@ -8,6 +8,13 @@ services:
     preDeployCommand: npm run prisma:push -- --skip-generate && npm run setup:ranking-tracking
     startCommand: npm run start
     healthCheckPath: /health/ready
+    envVars:
+      - key: PUBLIC_RANKING_EDGE_SECRET
+        sync: false
+      - key: PUBLIC_RANKING_ACCESS_ENABLED
+        value: "false"
+      - key: PUBLIC_RANKING_LOCATION_REQUIRED
+        value: "false"
     buildFilter:
       paths:
         - src/**

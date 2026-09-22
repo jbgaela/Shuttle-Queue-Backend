@@ -20,7 +20,7 @@ const envSchema = z.object({
   ARGON2_PARALLELISM: z.coerce.number().int().positive().default(1),
 }).superRefine((values, context) => {
   if (values.NODE_ENV !== "production") return;
-  if (values.PUBLIC_RANKING_EDGE_SECRET.length < 32) context.addIssue({ code: z.ZodIssueCode.custom, path: ["PUBLIC_RANKING_EDGE_SECRET"], message: "Configure a random edge signing secret of at least 32 characters in production." });
+  if (values.PUBLIC_RANKING_ACCESS_ENABLED === "true" && values.PUBLIC_RANKING_EDGE_SECRET.length < 32) context.addIssue({ code: z.ZodIssueCode.custom, path: ["PUBLIC_RANKING_EDGE_SECRET"], message: "Configure a random edge signing secret of at least 32 characters in production, or set PUBLIC_RANKING_ACCESS_ENABLED=false during rollout." });
   if (values.COOKIE_SECURE.toLowerCase() !== "true") context.addIssue({ code: z.ZodIssueCode.custom, path: ["COOKIE_SECURE"], message: "COOKIE_SECURE must be true in production." });
   if (values.TRUST_PROXY_HOPS < 1) context.addIssue({ code: z.ZodIssueCode.custom, path: ["TRUST_PROXY_HOPS"], message: "TRUST_PROXY_HOPS must be configured for the production proxy." });
   if (values.SESSION_SECRET_PEPPER === "replace-with-a-long-random-secret" || values.SUGGESTION_SIGNING_SECRET === "replace-with-a-different-long-random-secret") context.addIssue({ code: z.ZodIssueCode.custom, path: ["SESSION_SECRET_PEPPER"], message: "Production signing secrets must not use example values." });
