@@ -134,6 +134,7 @@ model QueueMaster {
   syncState             AccountSyncState?
   syncOperations        SyncOperationReceipt[]
   publicRankingPublications PublicRankingPublication[]
+  publicRankingLinks    PublicRankingLink[]
 }
 
 // A single database row serializes account mutations that must preserve
@@ -193,9 +194,58 @@ model PublicRankingPublication {
   createdAt        DateTime    @default(now())
   updatedAt        DateTime    @updatedAt
   version          Int         @default(1)
+  trackingLinks    PublicRankingLink[]
 
   @@unique([queueMasterId, sessionStartedAt])
   @@index([queueMasterId, enabled, revokedAt])
+}
+
+model PublicRankingLink {
+  id             String @id @default(uuid()) @map("_id")
+  publicationId  String
+  publication    PublicRankingPublication @relation(fields: [publicationId], references: [id])
+  queueMasterId  String
+  queueMaster    QueueMaster @relation(fields: [queueMasterId], references: [id])
+  tokenHash      String @unique
+  issuedAt       DateTime @default(now())
+  revokedAt      DateTime?
+  visits         PublicRankingVisit[]
+
+  @@index([queueMasterId, issuedAt, id])
+  @@index([publicationId])
+}
+
+enum RankingLocationStatus {
+  PENDING
+  GRANTED
+  DENIED
+  TIMEOUT
+  UNAVAILABLE
+}
+
+model PublicRankingVisit {
+  id                 String @id @default(uuid()) @map("_id")
+  linkId             String
+  link               PublicRankingLink @relation(fields: [linkId], references: [id])
+  visitKeyHash       String @unique
+  openedAt           DateTime @default(now())
+  expiresAt          DateTime
+  locationReceivedAt DateTime?
+  accessExpiresAt    DateTime?
+  ipAddress          String
+  device             String
+  browser            String
+  operatingSystem    String
+  city               String?
+  region             String?
+  country            String?
+  locationStatus     RankingLocationStatus @default(PENDING)
+  latitude           Float?
+  longitude          Float?
+  accuracy           Float?
+
+  @@index([linkId, openedAt, id])
+  @@index([linkId, locationStatus, openedAt, id])
 }
 
 model AccountSyncState {

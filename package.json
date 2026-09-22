@@ -26,13 +26,15 @@
     "test": "npm run prisma:generate && tsx --test tests/unit/*.test.ts",
     "test:unit": "node --test tests/unit/**/*.test.js",
     "test:domain": "npm run build:domain && npm run test --workspace @shuttle-queue/domain",
-    "deploy": "npx prisma db push && npx prisma generate"
+    "deploy": "npx prisma db push && npx prisma generate",
+    "setup:ranking-tracking": "node --env-file-if-exists=.env --import tsx prisma/setup-ranking-tracking.ts"
   },
   "dependencies": {
-    "@shuttle-queue/domain": "*",
     "@asteasolutions/zod-to-openapi": "9.1.0",
     "@prisma/client": "6.19.3",
+    "@shuttle-queue/domain": "*",
     "argon2": "0.45.1",
+    "bowser": "2.14.1",
     "cookie-parser": "1.4.7",
     "cors": "2.8.6",
     "express": "5.2.1",

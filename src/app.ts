@@ -3,7 +3,10 @@ import express, { type ErrorRequestHandler, type Request, type RequestHandler, t
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import { assertRankingLocation, createRankingTrackingRouter } from "./lib/ranking-tracking-routes.js";
+import { ensureTrackingLink, trackingHash } from "./lib/ranking-tracking.js";
+import { publicRankingBody, publicRankingEdge, publicRankingLimiter, rankingVisitorKey } from "./lib/ranking-tracking-http.js";
 import pino from "pino";
 import pinoHttpModule from "pino-http";
 import { Prisma, AccountRole, Gender, LatePenaltyState, MatchStatus, MatchSource, MatchmakingMode, PaymentKind, PaymentMethod, PlayerStatus, QueueMasterStatus, QueuePlayerStatus, TeamSide, CourtStatus, FeeMode, SkillLevel } from "@prisma/client";
@@ -30,7 +33,7 @@ import { parseIfMatchVersion, resolveProxySafeVersion } from "./lib/version.js";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 import { parseAndVerifySuggestionToken, signSuggestionToken } from "./lib/suggestion-token.js";
 
-const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "password", "passwordHash"] });
+const logger = pino({ level: config.logLevel, redact: ["req.headers.cookie", "req.headers.authorization", "req.headers.x-ranking-visit-key", "req.headers.x-ranking-edge-metadata", "req.headers.x-ranking-edge-signature", "password", "passwordHash"] });
 const pinoHttp = pinoHttpModule as unknown as (options: unknown) => RequestHandler;
 const DEFAULT_LATE_ARRIVAL_GRACE_MINUTES = 10;
 const db: any = prisma;
@@ -68,6 +71,9 @@ const cloudSnapshotSchema = z.strictObject({
 
 const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
   if (response.headersSent) { next(error); return; }
+  const trackingRequest = _request.originalUrl.includes("/public/rankings/") || _request.originalUrl.includes("/tracking-links");
+  if (trackingRequest && error?.type === "entity.too.large") error = new AppError(413, "PAYLOAD_TOO_LARGE", "Tracking requests must be at most 4 KB.");
+  if (trackingRequest && error?.type === "encoding.unsupported") error = new AppError(415, "UNSUPPORTED_MEDIA_TYPE", "Compressed tracking requests are not supported.");
   const err = error instanceof AppError
     ? error
     : error instanceof z.ZodError
@@ -80,7 +86,8 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
   const status = err instanceof AppError ? err.status : 500;
   if (status >= 500) {
     const prismaError = error instanceof Prisma.PrismaClientKnownRequestError ? error : null;
-    logger.error({
+    if (trackingRequest) logger.error({ requestId: response.locals.requestId, event: "ranking_tracking_request_failed", errorCode: prismaError?.code }, "Ranking tracking request failed");
+    else logger.error({
       requestId: response.locals.requestId,
       errorName: error instanceof Error ? error.name : typeof error,
       errorCode: prismaError?.code,
@@ -1020,7 +1027,7 @@ function publicPublicationState(publication: any) {
   return publication.revokedAt || !publication.enabled ? "REVOKED" : publication.finalizedAt ? "FINAL" : "LIVE";
 }
 function publicPublicationView(publication: any, includeToken = false) {
-  return { id: publication.id, sessionStartedAt: publication.sessionStartedAt, sessionEndedAt: publication.sessionEndedAt, state: publicPublicationState(publication), publishedAt: publication.publishedAt, finalizedAt: publication.finalizedAt, revokedAt: publication.revokedAt, version: publication.version, ...(includeToken && publication.enabled && !publication.revokedAt ? { token: publication.publicToken } : {}) };
+  return { id: publication.id, trackingLinkId: publication.trackingLinkId, sessionStartedAt: publication.sessionStartedAt, sessionEndedAt: publication.sessionEndedAt, state: publicPublicationState(publication), publishedAt: publication.publishedAt, finalizedAt: publication.finalizedAt, revokedAt: publication.revokedAt, version: publication.version, ...(includeToken && publication.enabled && !publication.revokedAt ? { token: publication.publicToken } : {}) };
 }
 async function finalizePublicRankingPublication(tx: any, queueMasterId: string, workspace: any, endedAt: Date) {
   const publication = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: workspace.startedAt } });
@@ -1030,11 +1037,14 @@ async function finalizePublicRankingPublication(tx: any, queueMasterId: string, 
   await tx.auditLog.create({ data: { queueMasterId, action: "PUBLIC_RANKINGS_FINALIZED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Public rankings finalized with the session", afterJson: { sessionEndedAt: endedAt.toISOString() }, requestId: `system:public-ranking:${endedAt.getTime()}` } });
   return finalized;
 }
+api.use(createRankingTrackingRouter());
 api.get("/rankings", requireAuth, route(async (request, response) => { const rows = await rankingRows(authUser(request).id); responseData(response, { rankingMethod: PRIZE_RANKING_METHOD, rankings: rows.map(rankingRow) }); }));
 api.get("/workspace/public-rankings", requireAuth, route(async (request, response) => {
   const queueMasterId = authUser(request).id;
   const workspace = await workspaceFor(request);
   const publications = await db.publicRankingPublication.findMany({ where: { queueMasterId, ...activePublicRankingWhere() }, orderBy: { sessionStartedAt: "desc" } });
+  const trackingLinks = await db.publicRankingLink.findMany({ where: { tokenHash: { in: publications.map((publication: any) => trackingHash(publication.publicToken)) } }, select: { id: true, tokenHash: true } });
+  for (const publication of publications) publication.trackingLinkId = trackingLinks.find((link: any) => link.tokenHash === trackingHash(publication.publicToken))?.id;
   const current = publications.find((publication: any) => publication.sessionStartedAt.getTime() === workspace.startedAt.getTime());
   responseData(response, { current: current ? publicPublicationView(current, true) : null, archives: publications.filter((publication: any) => publication.id !== current?.id).map((publication: any) => publicPublicationView(publication, true)) });
 }));
@@ -1044,19 +1054,20 @@ api.post("/workspace/public-rankings/publish", requireAuth, requireMutationOrigi
   assertVersion(workspace.version, proxySafeVersionFrom(request, "publish"));
   const result = await withTransactionRetry(async (tx) => {
     const existing = await tx.publicRankingPublication.findFirst({ where: { queueMasterId, sessionStartedAt: workspace.startedAt } });
-    if (existing?.enabled && !existing.revokedAt) return existing;
+    if (existing?.enabled && !existing.revokedAt) { const link = await ensureTrackingLink(tx, existing); return { ...existing, trackingLinkId: link.id }; }
     const now = new Date();
     const publication = existing
       ? await tx.publicRankingPublication.update({ where: { id: existing.id }, data: { publicToken: randomUUID(), enabled: true, publishedAt: now, revokedAt: null, version: { increment: 1 } } })
       : await tx.publicRankingPublication.create({ data: { queueMasterId, sessionStartedAt: workspace.startedAt, publicToken: randomUUID(), enabled: true, publishedAt: now, revokedAt: null } });
+    const trackingLink = await ensureTrackingLink(tx, publication);
     if (workspace.endedAt && !publication.finalizedAt) {
       const finalSnapshot = await publicRankingSnapshot(queueMasterId, publication.id, workspace.endedAt, tx);
       const finalized = await tx.publicRankingPublication.update({ where: { id: publication.id }, data: { sessionEndedAt: workspace.endedAt, finalizedAt: workspace.endedAt, finalSnapshot, version: { increment: 1 } } });
       await tx.auditLog.create({ data: { queueMasterId, action: existing ? "PUBLIC_RANKINGS_REPUBLISHED" : "PUBLIC_RANKINGS_PUBLISHED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Queue Master published final session rankings", afterJson: { sessionStartedAt: workspace.startedAt.toISOString(), finalizedAt: workspace.endedAt.toISOString() }, requestId: String(request.id ?? randomUUID()) } });
-      return finalized;
+      return { ...finalized, trackingLinkId: trackingLink.id };
     }
     await audit(tx, request, { action: existing ? "PUBLIC_RANKINGS_REPUBLISHED" : "PUBLIC_RANKINGS_PUBLISHED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: existing ? "Public rankings link rotated by Queue Master" : "Queue Master published rankings for this queue session", after: { sessionStartedAt: workspace.startedAt, publishedAt: publication.publishedAt } });
-    return publication;
+    return { ...publication, trackingLinkId: trackingLink.id };
   });
   responseData(response, publicPublicationView(result, true), 201);
 }));
@@ -1067,6 +1078,8 @@ api.post("/workspace/public-rankings/:id/revoke", requireAuth, requireMutationOr
   assertVersion(publication.version, proxySafeVersionFrom(request, "revoke"), "The current public rankings link version is required.");
   const revokedAt = new Date();
   const updated = await withTransactionRetry(async (tx) => {
+    const trackingLink = await ensureTrackingLink(tx, publication);
+    await tx.publicRankingLink.update({ where: { id: trackingLink.id }, data: { revokedAt } });
     const claimed = await tx.publicRankingPublication.updateMany({ where: { id: publication.id, queueMasterId, version: publication.version }, data: { enabled: false, revokedAt, version: { increment: 1 } } });
     if (claimed.count !== 1) throw conflict("VERSION_CONFLICT", "The public rankings link changed on another device.");
     await audit(tx, request, { action: "PUBLIC_RANKINGS_REVOKED", entityType: "PUBLIC_RANKING", entityId: publication.id, reason: "Queue Master revoked the public rankings link", before: { enabled: publication.enabled, revokedAt: publication.revokedAt }, after: { enabled: false, revokedAt } });
@@ -1074,12 +1087,13 @@ api.post("/workspace/public-rankings/:id/revoke", requireAuth, requireMutationOr
   });
   responseData(response, publicPublicationView(updated));
 }));
-api.get("/public/rankings/:token", rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: "draft-8", legacyHeaders: false }), route(async (request, response) => {
+api.get("/public/rankings/:token", publicRankingLimiter(120), route(async (request, response) => {
   const tokenValue = String(request.params.token);
   if (!idSchema.safeParse(tokenValue).success) throw notFound("Public rankings are not available.");
   const token = tokenValue;
   const publication = await db.publicRankingPublication.findFirst({ where: { publicToken: token, ...activePublicRankingWhere() } });
   if (!publication) throw notFound("Public rankings are not available.");
+  await assertRankingLocation(request, publication.id);
   response.setHeader("Cache-Control", "no-store");
   if (publication.finalizedAt) {
     if (!publication.finalSnapshot || typeof publication.finalSnapshot !== "object") throw notFound("Public rankings are not available.");
@@ -1097,12 +1111,13 @@ api.get("/public/rankings/:token", rateLimit({ windowMs: 60_000, limit: 120, sta
   const updatedAt = rows.reduce((latest: Date, row: any) => row.updatedAt > latest ? row.updatedAt : latest, workspace.updatedAt);
   responseData(response, { sessionStartedAt: publication.sessionStartedAt, firstMatchStartedAt: firstStartedMatch?.startedAt?.toISOString() ?? null, sessionEndedAt: workspace.endedAt, state: workspace.endedAt ? "FINAL" : "LIVE", serverTime: new Date().toISOString(), lastUpdatedAt: updatedAt, historyAvailable: true, rankingMethod: PRIZE_RANKING_METHOD, rankings: rows.map((row: any) => { const value = rankingRow(row); return { rank: value.rank, playerKey: publicPlayerKey(publication.id, row.id), player: value.player, matchesPlayed: value.matchesPlayed, wins: value.wins, losses: value.losses, winRateBasisPoints: value.winRateBasisPoints, pointsFor: value.pointsFor, pointsAgainst: value.pointsAgainst, pointDifferential: value.pointDifferential, eligible: value.eligible, gamesNeeded: value.gamesNeeded, rankingScoreBasisPoints: value.rankingScoreBasisPoints, pointPercentageBasisPoints: value.pointPercentageBasisPoints, isPrizePosition: value.isPrizePosition, seededDrawUsed: value.seededDrawUsed }; }) });
 }));
-api.get("/public/rankings/:token/players/:playerKey/history", rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: "draft-8", legacyHeaders: false }), route(async (request, response) => {
+api.get("/public/rankings/:token/players/:playerKey/history", publicRankingLimiter(120), route(async (request, response) => {
   const tokenValue = String(request.params.token);
   const playerKey = String(request.params.playerKey);
   if (!idSchema.safeParse(tokenValue).success || !playerKey) throw notFound("Public rankings are not available.");
   const publication = await db.publicRankingPublication.findFirst({ where: { publicToken: tokenValue, ...activePublicRankingWhere() } });
   if (!publication) throw notFound("Public rankings are not available.");
+  await assertRankingLocation(request, publication.id);
   response.setHeader("Cache-Control", "no-store");
   if (publication.finalizedAt) {
     if (!publication.finalSnapshot || typeof publication.finalSnapshot !== "object") throw notFound("Public rankings are not available.");
@@ -1159,9 +1174,36 @@ api.post("/admin/accounts", requireAuth, requireSuperAdmin, requireMutationOrigi
 api.patch("/admin/accounts/:id", requireAuth, requireSuperAdmin, requireMutationOrigin, route(async (request, response) => { const current = await db.queueMaster.findUnique({ where: { id: request.params.id } }); if (!current) throw notFound("Account not found."); assertVersion(current.version, versionFrom(request)); const body = parse(z.object({ role: z.nativeEnum(AccountRole).optional(), status: z.nativeEnum(QueueMasterStatus).optional() }), request.body); const updated = await db.queueMaster.update({ where: { id: current.id }, data: { role: body.role, status: body.status, version: { increment: 1 } }, include: { _count: { select: { players: true, queuePlayers: true, courts: true, matches: true } } } }); responseData(response, accountView(updated)); }));
 api.post("/admin/accounts/:id/reset-password", requireAuth, requireSuperAdmin, requireMutationOrigin, route(async (request, response) => { const current = await db.queueMaster.findUnique({ where: { id: request.params.id } }); if (!current) throw notFound("Account not found."); assertVersion(current.version, versionFrom(request)); const body = parse(z.object({ password: accountPasswordSchema }), request.body); await db.queueMaster.update({ where: { id: current.id }, data: { passwordHash: await passwordHash(body.password), passwordChangedAt: new Date(), version: { increment: 1 } } }); noContent(response); }));
 api.get("/admin/accounts/:id/deletion-preview", requireAuth, requireSuperAdmin, route(async (request, response) => { const account = await db.queueMaster.findUnique({ where: { id: request.params.id }, include: { _count: { select: { players: true, queuePlayers: true, courts: true, matches: true, payments: true, auditLogs: true, authSessions: true, idempotencyRecords: true } } } }); if (!account) throw notFound("Account not found."); const [participants, revisions, games, feeConfig] = await Promise.all([db.matchParticipant.count({ where: { match: { queueMasterId: account.id } } }), db.matchScoreRevision.count({ where: { match: { queueMasterId: account.id } } }), db.matchGame.count({ where: { scoreRevision: { match: { queueMasterId: account.id } } } }), db.queueFeeConfig.count({ where: { queueMasterId: account.id } })]); responseData(response, { account: accountView(account), deletion: { accountId: account.id, playerCount: account._count.players, queuePlayerCount: account._count.queuePlayers, courtCount: account._count.courts, matchCount: account._count.matches, participantCount: participants, scoreRevisionCount: revisions, gameCount: games, paymentCount: account._count.payments, feeConfigCount: feeConfig, auditCount: account._count.auditLogs, authSessionCount: account._count.authSessions, idempotencyRecordCount: account._count.idempotencyRecords } }); }));
-api.delete("/admin/accounts/:id", requireAuth, requireSuperAdmin, requireMutationOrigin, route(async (request, response) => { const current = await db.queueMaster.findUnique({ where: { id: request.params.id } }); if (!current) throw notFound("Account not found."); assertVersion(current.version, versionFrom(request)); const body = parse(z.object({ confirmationUsername: z.string(), currentPassword: z.string() }), request.body); if (body.confirmationUsername !== current.username || !(await verifyPassword(authUser(request).passwordHash, body.currentPassword).catch(() => false))) throw forbidden("The confirmation details are invalid."); await withTransactionRetry(async (tx) => { await tx.matchGame.deleteMany({ where: { scoreRevision: { match: { queueMasterId: current.id } } } }); await tx.matchScoreRevision.deleteMany({ where: { match: { queueMasterId: current.id } } }); await tx.matchParticipant.deleteMany({ where: { match: { queueMasterId: current.id } } }); await tx.match.deleteMany({ where: { queueMasterId: current.id } }); await tx.payment.deleteMany({ where: { queueMasterId: current.id } }); await tx.synergyTeam.deleteMany({ where: { queueMasterId: current.id } }); await tx.queuePlayer.deleteMany({ where: { queueMasterId: current.id } }); await tx.court.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueFeeConfig.deleteMany({ where: { queueMasterId: current.id } }); await tx.publicRankingPublication.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueWorkspace.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueMasterSettings.deleteMany({ where: { queueMasterId: current.id } }); await tx.auditLog.deleteMany({ where: { queueMasterId: current.id } }); await tx.idempotencyRecord.deleteMany({ where: { queueMasterId: current.id } }); await tx.authSession.deleteMany({ where: { queueMasterId: current.id } }); await tx.player.deleteMany({ where: { queueMasterId: current.id } }); await tx.accountSyncState.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueMaster.delete({ where: { id: current.id } }); }); noContent(response); }));
+api.delete("/admin/accounts/:id", requireAuth, requireSuperAdmin, requireMutationOrigin, route(async (request, response) => { const current = await db.queueMaster.findUnique({ where: { id: request.params.id } }); if (!current) throw notFound("Account not found."); assertVersion(current.version, versionFrom(request)); const body = parse(z.object({ confirmationUsername: z.string(), currentPassword: z.string() }), request.body); if (body.confirmationUsername !== current.username || !(await verifyPassword(authUser(request).passwordHash, body.currentPassword).catch(() => false))) throw forbidden("The confirmation details are invalid."); await withTransactionRetry(async (tx) => { await tx.matchGame.deleteMany({ where: { scoreRevision: { match: { queueMasterId: current.id } } } }); await tx.matchScoreRevision.deleteMany({ where: { match: { queueMasterId: current.id } } }); await tx.matchParticipant.deleteMany({ where: { match: { queueMasterId: current.id } } }); await tx.match.deleteMany({ where: { queueMasterId: current.id } }); await tx.payment.deleteMany({ where: { queueMasterId: current.id } }); await tx.synergyTeam.deleteMany({ where: { queueMasterId: current.id } }); await tx.queuePlayer.deleteMany({ where: { queueMasterId: current.id } }); await tx.court.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueFeeConfig.deleteMany({ where: { queueMasterId: current.id } }); await tx.publicRankingVisit.deleteMany({ where: { link: { queueMasterId: current.id } } }); await tx.publicRankingLink.deleteMany({ where: { queueMasterId: current.id } }); await tx.publicRankingPublication.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueWorkspace.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueMasterSettings.deleteMany({ where: { queueMasterId: current.id } }); await tx.auditLog.deleteMany({ where: { queueMasterId: current.id } }); await tx.idempotencyRecord.deleteMany({ where: { queueMasterId: current.id } }); await tx.authSession.deleteMany({ where: { queueMasterId: current.id } }); await tx.player.deleteMany({ where: { queueMasterId: current.id } }); await tx.accountSyncState.deleteMany({ where: { queueMasterId: current.id } }); await tx.queueMaster.delete({ where: { id: current.id } }); }); noContent(response); }));
 
-export function createApp() { const app = express(); app.set("trust proxy", config.trustProxyHops); app.use(helmet()); app.use(cors({ credentials: true, origin: (origin, callback) => { if (!origin || config.frontendOrigins.includes(origin)) callback(null, true); else callback(null, false); } })); app.use(express.json({ limit: "25mb" })); app.use(cookieParser()); app.use((pinoHttp as unknown as (options: unknown) => RequestHandler)({ logger, genReqId: () => randomUUID() })); app.use((request, response, next) => { response.locals.requestId = request.id; next(); }); app.get("/health", (_request, response) => response.json({ ok: true })); app.use("/api/v1", (_request, response) => response.status(426).json({ error: { code: "UPGRADE_REQUIRED", message: "This client must be upgraded to the current queue API." } })); app.use("/api/v2", rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: "draft-8", legacyHeaders: false }), api); app.use((_request, _response, next) => next(notFound("Route not found."))); app.use(errorHandler); return app; }
+export function createApp() {
+  const app = express();
+  app.set("trust proxy", config.trustProxyHops);
+  app.use(helmet());
+  app.use(cors({ credentials: true, origin: (origin, callback) => { if (!origin || config.frontendOrigins.includes(origin)) callback(null, true); else callback(null, false); } }));
+  app.use((pinoHttp as unknown as (options: unknown) => RequestHandler)({
+    logger,
+    genReqId: () => randomUUID(),
+    serializers: {
+      req: (request: { id: string; method: string; url: string }) => request.url.includes("/public/rankings/")
+        ? { id: request.id, method: request.method, url: request.url.split("?")[0].replace(/(\/public\/rankings\/)[^/?]+/g, "$1[redacted]") }
+        : request,
+    },
+  }));
+  app.use((request, response, next) => { response.locals.requestId = request.id; next(); });
+  app.use("/api/v2/public/rankings", publicRankingBody, publicRankingEdge);
+  app.use(express.json({ limit: "25mb" }));
+  app.use(cookieParser());
+  app.get("/health", (_request, response) => response.json({ ok: true }));
+  app.use("/api/v1", (_request, response) => response.status(426).json({ error: { code: "UPGRADE_REQUIRED", message: "This client must be upgraded to the current queue API." } }));
+  app.use("/api/v2", rateLimit({
+    windowMs: 60_000, limit: 300, standardHeaders: "draft-8", legacyHeaders: false,
+    keyGenerator: (request) => request.originalUrl.startsWith("/api/v2/public/rankings/") ? rankingVisitorKey(request) : ipKeyGenerator(request.ip ?? "127.0.0.1"),
+  }), api);
+  app.use((_request, _response, next) => next(notFound("Route not found.")));
+  app.use(errorHandler);
+  return app;
+}
 api.post("/matches/:id/correct", requireAuth, requireMutationOrigin, route(async (request, response) => {
   const body = parse(z.object({ games: z.array(z.object({ teamAScore: z.number().int(), teamBScore: z.number().int() })).min(1).max(3), reason: z.string().trim().min(1).max(500).optional() }), request.body);
   const match = await ownedMatch(request, request.params.id, true);
