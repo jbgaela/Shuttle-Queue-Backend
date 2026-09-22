@@ -12,9 +12,9 @@ services:
       - key: PUBLIC_RANKING_EDGE_SECRET
         sync: false
       - key: PUBLIC_RANKING_ACCESS_ENABLED
-        value: "false"
+        value: "true"
       - key: PUBLIC_RANKING_LOCATION_REQUIRED
-        value: "false"
+        value: "true"
     buildFilter:
       paths:
         - src/**
