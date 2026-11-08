@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseBodyVersion, parseIfMatchVersion, resolveProxySafeVersion } from "../../src/lib/version.js";
+import {
+  parseBodyVersion,
+  parseIfMatchVersion,
+  resolveProxySafeVersion,
+} from "../../src/lib/version.js";
 
 test("workspace version parser accepts legacy and quoted If-Match values", () => {
   assert.equal(parseIfMatchVersion("42"), 42);
   assert.equal(parseIfMatchVersion('"42"'), 42);
-  assert.equal(parseIfMatchVersion("  \"42\"  "), 42);
+  assert.equal(parseIfMatchVersion('  "42"  '), 42);
 });
 
 test("workspace version parser rejects malformed or unsafe If-Match values", () => {

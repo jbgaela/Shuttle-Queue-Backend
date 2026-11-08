@@ -22,7 +22,12 @@ export function validateScores(games: ScoreInput[], settings: ScoreSettings): Va
   const validated: ValidatedScore[] = [];
 
   for (const game of games) {
-    if (!Number.isInteger(game.teamAScore) || !Number.isInteger(game.teamBScore) || game.teamAScore < 0 || game.teamBScore < 0) {
+    if (
+      !Number.isInteger(game.teamAScore) ||
+      !Number.isInteger(game.teamBScore) ||
+      game.teamAScore < 0 ||
+      game.teamBScore < 0
+    ) {
       throw badRequest("Scores must be non-negative integers.");
     }
     if (game.teamAScore === game.teamBScore) throw badRequest("A game cannot end in a tie.");
@@ -31,7 +36,9 @@ export function validateScores(games: ScoreInput[], settings: ScoreSettings): Va
     const maximum = settings.scoreCap ?? settings.pointsToWin;
     if (high > maximum || low > maximum) throw badRequest(`Scores cannot exceed ${maximum}.`);
     const reachesCap = high === maximum;
-    const validRace = reachesCap ? high === maximum && low < high : high >= settings.pointsToWin && high - low >= settings.winBy;
+    const validRace = reachesCap
+      ? high === maximum && low < high
+      : high >= settings.pointsToWin && high - low >= settings.winBy;
     if (!validRace) throw badRequest("The submitted score does not satisfy the queue rules.");
     const winnerTeam = game.teamAScore > game.teamBScore ? TeamSide.A : TeamSide.B;
     validated.push({ ...game, winnerTeam });
@@ -39,7 +46,9 @@ export function validateScores(games: ScoreInput[], settings: ScoreSettings): Va
     else bWins += 1;
     if (aWins >= requiredWins || bWins >= requiredWins) break;
   }
-  if (aWins < requiredWins && bWins < requiredWins) throw badRequest("The match series is not complete.");
-  if (validated.length !== games.length) throw badRequest("No games may be submitted after the match is already won.");
+  if (aWins < requiredWins && bWins < requiredWins)
+    throw badRequest("The match series is not complete.");
+  if (validated.length !== games.length)
+    throw badRequest("No games may be submitted after the match is already won.");
   return validated;
 }

@@ -25,8 +25,10 @@ export function resolveProxySafeVersion(headerValue: string | undefined, bodyVal
   return {
     headerPresent,
     bodyPresent,
-    mismatch: headerVersion !== undefined && bodyVersion !== undefined && headerVersion !== bodyVersion,
-    version: headerPresent && headerVersion === undefined ? undefined : headerVersion ?? bodyVersion,
+    mismatch:
+      headerVersion !== undefined && bodyVersion !== undefined && headerVersion !== bodyVersion,
+    version:
+      headerPresent && headerVersion === undefined ? undefined : (headerVersion ?? bodyVersion),
   };
 }
 

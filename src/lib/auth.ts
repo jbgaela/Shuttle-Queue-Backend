@@ -8,7 +8,14 @@ import { AppError, forbidden, unauthorized } from "./errors.js";
 import { slidingIdleExpiry } from "./session-expiry.js";
 
 export type AuthenticatedRequest = Request & {
-  auth?: { queueMaster: QueueMaster; sessionId: string; csrfToken: string; csrfTokenHash: string; absoluteExpiresAt: Date; sessionVersion: number };
+  auth?: {
+    queueMaster: QueueMaster;
+    sessionId: string;
+    csrfToken: string;
+    csrfTokenHash: string;
+    absoluteExpiresAt: Date;
+    sessionVersion: number;
+  };
 };
 
 const cookieName = config.cookieSecure ? "__Host-bq-session" : "bq-session";
@@ -24,7 +31,8 @@ const THROTTLE_ENTRY_TTL_MS = 30 * 60_000;
 const THROTTLE_CLEANUP_INTERVAL_MS = 60_000;
 let lastThrottleCleanupAt = 0;
 
-const digest = (value: string) => createHmac("sha256", config.sessionSecretPepper).update(value).digest("hex");
+const digest = (value: string) =>
+  createHmac("sha256", config.sessionSecretPepper).update(value).digest("hex");
 const token = () => randomBytes(32).toString("base64url");
 const safeEqual = (a: string, b: string) => {
   const left = Buffer.from(a);
@@ -52,7 +60,8 @@ const setSessionCookie = (response: Response, value: string, expires: Date, csrf
   });
 };
 
-const setCsrfCookie = (response: Response, value: string, expires: Date) => response.cookie(csrfCookieName, value, { ...sharedCookieOptions, httpOnly: false, expires });
+const setCsrfCookie = (response: Response, value: string, expires: Date) =>
+  response.cookie(csrfCookieName, value, { ...sharedCookieOptions, httpOnly: false, expires });
 
 export const clearSessionCookie = (response: Response) => {
   response.clearCookie(cookieName, { ...sharedCookieOptions, httpOnly: true });
@@ -72,8 +81,12 @@ export async function issueSession(queueMasterId: string, request: Request, resp
       csrfTokenHash: digest(csrfToken),
       idleExpiresAt,
       absoluteExpiresAt,
-      userAgentHash: request.get("user-agent") ? createHash("sha256").update(request.get("user-agent")!).digest("hex") : undefined,
-      ipPrefixHash: request.ip ? createHash("sha256").update(request.ip.split(".").slice(0, 3).join(".")).digest("hex") : undefined,
+      userAgentHash: request.get("user-agent")
+        ? createHash("sha256").update(request.get("user-agent")!).digest("hex")
+        : undefined,
+      ipPrefixHash: request.ip
+        ? createHash("sha256").update(request.ip.split(".").slice(0, 3).join(".")).digest("hex")
+        : undefined,
     },
   });
   setSessionCookie(response, `${session.id}.${secret}`, absoluteExpiresAt, csrfToken);
@@ -86,10 +99,22 @@ export async function rotateSession(request: AuthenticatedRequest, response: Res
   const nextSecret = token();
   const nextCsrf = token();
   const now = new Date();
-  const idleExpiresAt = slidingIdleExpiry(now, current.absoluteExpiresAt, config.sessionIdleMinutes);
+  const idleExpiresAt = slidingIdleExpiry(
+    now,
+    current.absoluteExpiresAt,
+    config.sessionIdleMinutes,
+  );
   const claimed = await prisma.authSession.updateMany({
     where: { id: current.sessionId, version: current.sessionVersion },
-    data: { previousHash: digest((request.cookies?.[cookieName] ?? "").split(".").slice(1).join(".")), secretHash: digest(nextSecret), csrfTokenHash: digest(nextCsrf), rotatedAt: now, lastSeenAt: now, idleExpiresAt, version: { increment: 1 } },
+    data: {
+      previousHash: digest((request.cookies?.[cookieName] ?? "").split(".").slice(1).join(".")),
+      secretHash: digest(nextSecret),
+      csrfTokenHash: digest(nextCsrf),
+      rotatedAt: now,
+      lastSeenAt: now,
+      idleExpiresAt,
+      version: { increment: 1 },
+    },
   });
   if (claimed.count !== 1) throw unauthorized("Your session has expired.");
   const updated = await prisma.authSession.findUnique({ where: { id: current.sessionId } });
@@ -102,22 +127,55 @@ async function resolveAuth(request: AuthenticatedRequest) {
   const parsed = parseSessionCookie(request.cookies?.[cookieName]);
   if (!parsed) throw unauthorized();
   const now = new Date();
-  const session = await prisma.authSession.findUnique({ where: { id: parsed.id }, include: { queueMaster: true } });
-  if (!session || session.revokedAt || session.queueMaster.status !== "ACTIVE" || session.idleExpiresAt < now || session.absoluteExpiresAt < now) throw unauthorized("Your session has expired.");
+  const session = await prisma.authSession.findUnique({
+    where: { id: parsed.id },
+    include: { queueMaster: true },
+  });
+  if (
+    !session ||
+    session.revokedAt ||
+    session.queueMaster.status !== "ACTIVE" ||
+    session.idleExpiresAt < now ||
+    session.absoluteExpiresAt < now
+  )
+    throw unauthorized("Your session has expired.");
   const secretHash = digest(parsed.secret);
   if (!safeEqual(secretHash, session.secretHash)) {
     if (session.previousHash && safeEqual(secretHash, session.previousHash)) {
-      await prisma.authSession.update({ where: { id: session.id }, data: { revokedAt: new Date(), revokeReason: "refresh-replay" } });
+      await prisma.authSession.update({
+        where: { id: session.id },
+        data: { revokedAt: new Date(), revokeReason: "refresh-replay" },
+      });
     }
     throw unauthorized("Your session has expired.");
   }
   const csrfToken = request.get("x-csrf-token") ?? "";
-  if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS" && !safeEqual(digest(csrfToken), session.csrfTokenHash)) throw new AppError(403, "CSRF_INVALID", "The request could not be verified.");
+  if (
+    request.method !== "GET" &&
+    request.method !== "HEAD" &&
+    request.method !== "OPTIONS" &&
+    !safeEqual(digest(csrfToken), session.csrfTokenHash)
+  )
+    throw new AppError(403, "CSRF_INVALID", "The request could not be verified.");
   if (session.lastSeenAt.getTime() < now.getTime() - 5 * 60_000) {
-    const idleExpiresAt = slidingIdleExpiry(now, session.absoluteExpiresAt, config.sessionIdleMinutes);
-    await prisma.authSession.updateMany({ where: { id: session.id, revokedAt: null }, data: { lastSeenAt: now, idleExpiresAt } });
+    const idleExpiresAt = slidingIdleExpiry(
+      now,
+      session.absoluteExpiresAt,
+      config.sessionIdleMinutes,
+    );
+    await prisma.authSession.updateMany({
+      where: { id: session.id, revokedAt: null },
+      data: { lastSeenAt: now, idleExpiresAt },
+    });
   }
-  request.auth = { queueMaster: session.queueMaster, sessionId: session.id, csrfToken, csrfTokenHash: session.csrfTokenHash, absoluteExpiresAt: session.absoluteExpiresAt, sessionVersion: session.version };
+  request.auth = {
+    queueMaster: session.queueMaster,
+    sessionId: session.id,
+    csrfToken,
+    csrfTokenHash: session.csrfTokenHash,
+    absoluteExpiresAt: session.absoluteExpiresAt,
+    sessionVersion: session.version,
+  };
   return request.auth;
 }
 
@@ -139,7 +197,12 @@ export async function currentCsrfToken(request: AuthenticatedRequest, response: 
 
   const nextCsrf = token();
   const claimed = await prisma.authSession.updateMany({
-    where: { id: auth.sessionId, version: auth.sessionVersion, csrfTokenHash: auth.csrfTokenHash, revokedAt: null },
+    where: {
+      id: auth.sessionId,
+      version: auth.sessionVersion,
+      csrfTokenHash: auth.csrfTokenHash,
+      revokedAt: null,
+    },
     data: { csrfTokenHash: digest(nextCsrf) },
   });
   if (claimed.count !== 1) throw unauthorized("Your session has expired.");
@@ -188,7 +251,12 @@ export async function throttleLogin(key: string) {
   const now = Date.now();
   await cleanupExpiredThrottleEntries(now);
   const entry = await prisma.loginThrottle.findUnique({ where: { keyHash: throttleKeyHash(key) } });
-  return !entry || entry.expiresAt <= new Date(now) || !entry.blockedUntil || entry.blockedUntil <= new Date(now);
+  return (
+    !entry ||
+    entry.expiresAt <= new Date(now) ||
+    !entry.blockedUntil ||
+    entry.blockedUntil <= new Date(now)
+  );
 }
 
 export async function recordLoginFailure(key: string) {
@@ -198,17 +266,37 @@ export async function recordLoginFailure(key: string) {
   const prior = await prisma.loginThrottle.findUnique({ where: { keyHash } });
   const expiresAt = new Date(now + THROTTLE_ENTRY_TTL_MS);
   if (!prior || prior.expiresAt <= new Date(now)) {
-    await prisma.loginThrottle.upsert({ where: { keyHash }, create: { keyHash, failureCount: 1, windowStarted: new Date(now), expiresAt }, update: { failureCount: 1, windowStarted: new Date(now), blockedUntil: null, expiresAt } });
+    await prisma.loginThrottle.upsert({
+      where: { keyHash },
+      create: { keyHash, failureCount: 1, windowStarted: new Date(now), expiresAt },
+      update: { failureCount: 1, windowStarted: new Date(now), blockedUntil: null, expiresAt },
+    });
     return;
   }
   const failures = prior.failureCount + 1;
-  await prisma.loginThrottle.update({ where: { id: prior.id }, data: { failureCount: { increment: 1 }, blockedUntil: failures >= 5 ? new Date(now + Math.min(15 * 60_000, failures * 30_000)) : prior.blockedUntil, expiresAt } });
+  await prisma.loginThrottle.update({
+    where: { id: prior.id },
+    data: {
+      failureCount: { increment: 1 },
+      blockedUntil:
+        failures >= 5
+          ? new Date(now + Math.min(15 * 60_000, failures * 30_000))
+          : prior.blockedUntil,
+      expiresAt,
+    },
+  });
 }
 
 export async function clearLoginFailures(key: string) {
   await prisma.loginThrottle.deleteMany({ where: { keyHash: throttleKeyHash(key) } });
 }
 
-export const passwordHash = (password: string) => argon2.hash(password, { type: argon2.argon2id, memoryCost: config.argon2MemoryKib, timeCost: config.argon2TimeCost, parallelism: config.argon2Parallelism });
+export const passwordHash = (password: string) =>
+  argon2.hash(password, {
+    type: argon2.argon2id,
+    memoryCost: config.argon2MemoryKib,
+    timeCost: config.argon2TimeCost,
+    parallelism: config.argon2Parallelism,
+  });
 export const verifyPassword = (hash: string, password: string) => argon2.verify(hash, password);
 export const sessionCookieName = cookieName;

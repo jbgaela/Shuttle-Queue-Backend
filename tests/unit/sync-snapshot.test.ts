@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeQueuePlayerSnapshotFields, shouldRemoveFeeConfig, stalePlayerFilter } from "../../src/lib/sync-snapshot.js";
+import {
+  normalizeQueuePlayerSnapshotFields,
+  shouldRemoveFeeConfig,
+  stalePlayerFilter,
+} from "../../src/lib/sync-snapshot.js";
 
 test("stale player filter removes cloud players absent from a non-empty local roster", () => {
-  assert.deepEqual(stalePlayerFilter(["player-2", "player-3"]), { id: { notIn: ["player-2", "player-3"] } });
+  assert.deepEqual(stalePlayerFilter(["player-2", "player-3"]), {
+    id: { notIn: ["player-2", "player-3"] },
+  });
 });
 
 test("stale player filter matches every cloud player for an empty local roster", () => {
@@ -16,8 +22,12 @@ test("fee configuration is removed only when the local snapshot has none", () =>
 });
 
 test("normalizes omitted legacy queue-player fields while preserving supplied values", () => {
-  const snapshot = { queuePlayers: [{ id: "qp1", amountDueMinor: 25, latePenaltyState: "PENDING" }] };
-  const normalized = normalizeQueuePlayerSnapshotFields(snapshot) as { queuePlayers: Array<Record<string, unknown>> };
+  const snapshot = {
+    queuePlayers: [{ id: "qp1", amountDueMinor: 25, latePenaltyState: "PENDING" }],
+  };
+  const normalized = normalizeQueuePlayerSnapshotFields(snapshot) as {
+    queuePlayers: Array<Record<string, unknown>>;
+  };
   const player = normalized.queuePlayers[0]!;
 
   assert.equal(player.amountDueMinor, 25);
@@ -29,13 +39,19 @@ test("normalizes omitted legacy queue-player fields while preserving supplied va
 });
 
 test("normalizes omitted no-show penalty fields for legacy snapshots", () => {
-  const normalized = normalizeQueuePlayerSnapshotFields({ settings: { id: "settings" }, feeConfig: { id: "fee" }, queuePlayers: [] }) as { settings: Record<string, unknown>; feeConfig: Record<string, unknown> };
+  const normalized = normalizeQueuePlayerSnapshotFields({
+    settings: { id: "settings" },
+    feeConfig: { id: "fee" },
+    queuePlayers: [],
+  }) as { settings: Record<string, unknown>; feeConfig: Record<string, unknown> };
   assert.equal(normalized.settings.noShowPenaltyMinor, 0);
   assert.equal(normalized.feeConfig.noShowPenaltyMinor, 0);
 });
 
 test("does not turn invalid supplied values into valid defaults", () => {
-  const normalized = normalizeQueuePlayerSnapshotFields({ queuePlayers: [{ amountDueMinor: null, latePenaltyState: "INVALID" }] }) as { queuePlayers: Array<Record<string, unknown>> };
+  const normalized = normalizeQueuePlayerSnapshotFields({
+    queuePlayers: [{ amountDueMinor: null, latePenaltyState: "INVALID" }],
+  }) as { queuePlayers: Array<Record<string, unknown>> };
   assert.equal(normalized.queuePlayers[0]!.amountDueMinor, null);
   assert.equal(normalized.queuePlayers[0]!.latePenaltyState, "INVALID");
 });

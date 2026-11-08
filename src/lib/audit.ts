@@ -13,7 +13,11 @@ function jsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
 
-export function auditLogData(queueMasterId: string, requestId: string, values: AuditValues): Prisma.AuditLogUncheckedCreateInput {
+export function auditLogData(
+  queueMasterId: string,
+  requestId: string,
+  values: AuditValues,
+): Prisma.AuditLogUncheckedCreateInput {
   return {
     queueMasterId,
     action: values.action,
