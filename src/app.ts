@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { gzip } from "node:zlib";
 import express, {
   type ErrorRequestHandler,
   type Request,
@@ -71,7 +72,7 @@ import {
   type MatchmakingOptions,
 } from "./lib/matchmaking.js";
 import { validateScores, type ScoreInput } from "./lib/score.js";
-import { normalizeQueuePlayerSnapshotFields } from "./lib/sync-snapshot.js";
+import { normalizeQueuePlayerSnapshotFields, snapshotQueueSummaries } from "./lib/sync-snapshot.js";
 import { persistSyncSnapshot, type SyncUpload } from "./lib/sync-persistence.js";
 import {
   clearLoginFailures,
@@ -106,6 +107,11 @@ import { PRIZE_RANKING_METHOD, rankRecords, rankingStats } from "./lib/prize-ran
 import { parseIfMatchVersion, resolveProxySafeVersion } from "./lib/version.js";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 import { parseAndVerifySuggestionToken, signSuggestionToken } from "./lib/suggestion-token.js";
+import {
+  createSyncUploadAdmission,
+  markSyncUploadBodyParsed,
+  releaseSyncUploadAdmission,
+} from "./lib/sync-upload-admission.js";
 
 const logger = pino({
   level: config.logLevel,
@@ -164,6 +170,13 @@ const PLAYER_NAME_CONFLICT_MESSAGE =
   "A player with this name has already been created or is already in the current queue.";
 const SESSION_PLAYER_NOT_REMOVABLE_MESSAGE =
   "Only inactive or checked-out players without match or payment history can be removed from this session.";
+const requireSyncAuth: RequestHandler = (request, response, next) => {
+  if ((request as AuthenticatedRequest).auth) {
+    next();
+    return;
+  }
+  requireAuth(request, response, next);
+};
 const noShowPenaltySnapshotSchema = z
   .number()
   .int()
@@ -371,6 +384,7 @@ const cloudSnapshotSchema = z.strictObject({
 });
 
 const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
+  releaseSyncUploadAdmission(_request);
   if (response.headersSent) {
     next(error);
     return;
@@ -378,8 +392,14 @@ const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
   const trackingRequest =
     _request.originalUrl.includes("/public/rankings/") ||
     _request.originalUrl.includes("/tracking-links");
-  if (trackingRequest && error?.type === "entity.too.large")
-    error = new AppError(413, "PAYLOAD_TOO_LARGE", "Tracking requests must be at most 4 KB.");
+  if (error?.type === "entity.too.large")
+    error = new AppError(
+      413,
+      "PAYLOAD_TOO_LARGE",
+      trackingRequest
+        ? "Tracking requests must be at most 4 KB."
+        : "The request body exceeds the allowed size.",
+    );
   if (trackingRequest && error?.type === "encoding.unsupported")
     error = new AppError(
       415,
@@ -489,7 +509,7 @@ const route =
             }
             const queueMasterId = authUser(request).id;
             const before = await snapshotWithSynergyTeams(
-              await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId, tx), tx),
+              await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId, tx)),
               tx,
             );
             const state = await tx.accountSyncState.upsert({
@@ -499,7 +519,7 @@ const route =
             });
             await handler(request, response);
             const after = await snapshotWithSynergyTeams(
-              await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId, tx), tx),
+              await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId, tx)),
               tx,
             );
             if (snapshotChecksum(before) !== snapshotChecksum(after)) {
@@ -525,7 +545,8 @@ const route =
         );
         const pending = response.locals.syncResponse;
         if (pending?.status === 204) response.status(204).end();
-        else if (pending) response.status(pending.status).json(pending.body);
+        else if (pending)
+          await sendSyncSnapshotResponse(request, response, pending.status, pending.body);
       } finally {
         response.locals.deferSyncResponse = false;
         delete response.locals.syncResponse;
@@ -661,6 +682,30 @@ const responseData = (response: Response, data: unknown, status = 200, meta?: un
   }
   return response.status(status).json(body);
 };
+const sendSyncSnapshotResponse = async (
+  request: Request,
+  response: Response,
+  status: number,
+  body: unknown,
+) => {
+  if (
+    !["/sync/snapshot", "/sync/snapshot-legacy"].includes(request.path) ||
+    !request.acceptsEncodings("gzip")
+  ) {
+    response.status(status).json(body);
+    return;
+  }
+  const serialized = JSON.stringify(body);
+  const compressed = await new Promise<Buffer>((resolve, reject) => {
+    gzip(serialized, { level: 1 }, (error, result) => {
+      if (error) reject(error);
+      else resolve(result);
+    });
+  });
+  response.vary("Accept-Encoding");
+  response.setHeader("Content-Encoding", "gzip");
+  response.type("json").status(status).send(compressed);
+};
 const noContent = (response: Response) => {
   if (response.locals.deferSyncResponse) {
     response.locals.syncResponse = { status: 204 };
@@ -722,7 +767,7 @@ const owner = (request: Request, id: string | string[]) => ({
   queueMasterId: authUser(request).id,
 });
 
-api.use("/sync/snapshot", requireAuth, (request, _response, next) => {
+api.use("/sync/snapshot", requireSyncAuth, (request, _response, next) => {
   ensureWorkspace(authUser(request).id)
     .then(() => next())
     .catch(next);
@@ -735,18 +780,39 @@ api.use("/sync/snapshot", (request, _response, next) => {
   ) {
     const normalizedSnapshot = normalizeQueuePlayerSnapshotFields(request.body.snapshot);
     request.body.snapshot = normalizedSnapshot;
-    const checked = cloudSnapshotSchema.safeParse({
-      ...(normalizedSnapshot as object),
-      schemaVersion: 2,
-    });
-    if (!checked.success) {
-      next(checked.error);
-      return;
+    if (request.body.schemaVersion !== 3) {
+      const checked = cloudSnapshotSchema.safeParse({
+        ...(normalizedSnapshot as object),
+        schemaVersion: 2,
+      });
+      if (!checked.success) {
+        next(checked.error);
+        return;
+      }
     }
     const snapshot = normalizedSnapshot as CloudSnapshotV2;
-    if (Array.isArray(snapshot.queuePlayers) && Array.isArray(snapshot.matches)) {
+    const readyForQueueSummary =
+      Array.isArray(snapshot.queuePlayers) &&
+      snapshot.queuePlayers.every((player) => player && typeof player.id === "string") &&
+      Array.isArray(snapshot.matches) &&
+      snapshot.matches.every(
+        (match) =>
+          match &&
+          typeof match.id === "string" &&
+          typeof match.status === "string" &&
+          typeof match.queuedAt === "string" &&
+          Array.isArray(match.participants) &&
+          match.participants.every(
+            (participant) => participant && typeof participant.queuePlayerId === "string",
+          ),
+      );
+    if (readyForQueueSummary) {
+      const summaries = snapshotQueueSummaries(snapshot);
       for (const player of snapshot.queuePlayers) {
-        const summary = snapshotQueueSummary(snapshot, player.id);
+        const summary = summaries.get(player.id) ?? {
+          status: QueuePlayerStatus.WAITING,
+          currentMatchId: null,
+        };
         if (
           summary.status !== QueuePlayerStatus.WAITING ||
           (
@@ -769,7 +835,7 @@ api.use("/sync/snapshot", (request, _response, next) => {
 
 // v3 merges a device snapshot with the current cloud state. The legacy route below
 // remains available for accounts that have not yet upgraded their first device.
-api.put("/sync/snapshot", requireAuth, requireMutationOrigin, (request, response, next) => {
+api.put("/sync/snapshot", requireSyncAuth, requireMutationOrigin, (request, response, next) => {
   if (request.body?.schemaVersion !== 3) {
     next();
     return;
@@ -828,6 +894,14 @@ api.put("/sync/snapshot", requireAuth, requireMutationOrigin, (request, response
     )
       throw badRequest("The snapshot is not valid for this account.");
     const queueMasterId = authUser(request).id;
+    const observedState = await db.accountSyncState.upsert({
+      where: { queueMasterId },
+      create: { queueMasterId, schemaVersion: 2 },
+      update: {},
+    });
+    const observedSnapshot = await snapshotWithSynergyTeams(
+      await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId)),
+    );
     const result = await withTransactionRetry(
       (tx) =>
         persistSyncSnapshot(
@@ -836,12 +910,15 @@ api.put("/sync/snapshot", requireAuth, requireMutationOrigin, (request, response
           queueMasterId,
           async () => {
             const currentState = await tx.accountSyncState.findUnique({ where: { queueMasterId } });
+            if (!currentState || currentState.version !== observedState.version)
+              throw conflict(
+                "SYNC_CLOUD_CHANGED",
+                "Cloud data changed while the current snapshot was being prepared. Retry synchronization; pending work is preserved.",
+                { cloudRevision: currentState?.cloudRevision ?? observedState.cloudRevision },
+              );
             return {
-              snapshot: await snapshotWithSynergyTeams(
-                await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId, tx), tx),
-                tx,
-              ),
-              metadata: currentState?.mergeMetadata as any,
+              snapshot: observedSnapshot,
+              metadata: observedState.mergeMetadata as any,
             };
           },
         ),
@@ -852,14 +929,18 @@ api.put("/sync/snapshot", requireAuth, requireMutationOrigin, (request, response
       (await snapshotWithSynergyTeams(
         await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId)),
       ));
-    responseData(response, {
-      cloudRevision: result.state.cloudRevision,
-      lastSyncedAt: result.state.lastSyncedAt,
-      schemaVersion: 3,
-      alreadyApplied: result.alreadyApplied,
-      snapshot: responseSnapshot,
-      metadata: result.metadata,
+    await sendSyncSnapshotResponse(request, response, 200, {
+      data: {
+        cloudRevision: result.state.cloudRevision,
+        lastSyncedAt: result.state.lastSyncedAt,
+        schemaVersion: 3,
+        alreadyApplied: result.alreadyApplied,
+        snapshot: responseSnapshot,
+        metadata: result.metadata,
+      },
+      requestId: response.locals.requestId,
     });
+    releaseSyncUploadAdmission(request);
   })(request, response, next);
 });
 api.get(
@@ -1772,30 +1853,6 @@ async function serveLatePenalties(tx: any, queueMasterId: string, queuePlayerIds
     where: { queueMasterId, id: { in: ids }, latePenaltyState: LatePenaltyState.PENDING },
     data: { latePenaltyState: LatePenaltyState.SERVED, version: { increment: 1 } },
   });
-}
-
-function snapshotQueueSummary(snapshot: CloudSnapshotV2, queuePlayerId: string) {
-  const active = snapshot.matches.filter(
-    (match) =>
-      match.status === "IN_PROGRESS" &&
-      match.participants.some((participant) => participant.queuePlayerId === queuePlayerId),
-  );
-  if (active.length > 1) throw badRequest("A player cannot be in more than one active match.");
-  const queued = snapshot.matches
-    .filter(
-      (match) =>
-        match.status === "QUEUED" &&
-        match.participants.some((participant) => participant.queuePlayerId === queuePlayerId),
-    )
-    .sort((a, b) => a.queuedAt.localeCompare(b.queuedAt) || a.id.localeCompare(b.id));
-  return {
-    status: active.length
-      ? QueuePlayerStatus.PLAYING
-      : queued.length
-        ? QueuePlayerStatus.QUEUED
-        : QueuePlayerStatus.WAITING,
-    currentMatchId: active[0]?.id ?? queued[0]?.id ?? null,
-  };
 }
 
 async function matchHistoryFor(queueMasterId: string) {
@@ -5181,18 +5238,21 @@ api.post(
 );
 
 async function buildSnapshot(queueMasterId: string, database = db): Promise<CloudSnapshotV2> {
-  const settings = await database.queueMasterSettings.findUnique({ where: { queueMasterId } });
-  const workspace = await database.queueWorkspace.findUnique({ where: { queueMasterId } });
-  const players = await database.player.findMany({ where: { queueMasterId } });
-  const queuePlayers = await database.queuePlayer.findMany({ where: { queueMasterId } });
-  const courts = await database.court.findMany({ where: { queueMasterId } });
-  const matches = await database.match.findMany({
-    where: { queueMasterId },
-    include: { participants: true, scoreRevisions: { include: { games: true } } },
-  });
-  const feeConfig = await database.queueFeeConfig.findUnique({ where: { queueMasterId } });
-  const payments = await database.payment.findMany({ where: { queueMasterId } });
-  const audits = await database.auditLog.findMany({ where: { queueMasterId } });
+  const [settings, workspace, players, queuePlayers, courts, matches, feeConfig, payments, audits] =
+    await Promise.all([
+      database.queueMasterSettings.findUnique({ where: { queueMasterId } }),
+      database.queueWorkspace.findUnique({ where: { queueMasterId } }),
+      database.player.findMany({ where: { queueMasterId } }),
+      database.queuePlayer.findMany({ where: { queueMasterId } }),
+      database.court.findMany({ where: { queueMasterId } }),
+      database.match.findMany({
+        where: { queueMasterId },
+        include: { participants: true, scoreRevisions: { include: { games: true } } },
+      }),
+      database.queueFeeConfig.findUnique({ where: { queueMasterId } }),
+      database.payment.findMany({ where: { queueMasterId } }),
+      database.auditLog.findMany({ where: { queueMasterId } }),
+    ]);
   return {
     schemaVersion: 2,
     queueMasterId,
@@ -5249,53 +5309,64 @@ async function buildSnapshot(queueMasterId: string, database = db): Promise<Clou
       closedAt: c.closedAt?.toISOString() ?? null,
       version: c.version,
     })),
-    matches: matches.map((m: any) => ({
-      id: m.id,
-      courtId: m.courtId,
-      status: m.status,
-      source: m.source,
-      matchmakingMode: m.matchmakingMode,
-      algorithmVersion: m.algorithmVersion,
-      suggestionKey: m.suggestionKey,
-      suggestionExplanation: m.suggestionExplanation,
-      pointsToWin: m.pointsToWin,
-      winBy: m.winBy,
-      scoreCap: m.scoreCap,
-      bestOf: m.bestOf as 1 | 3,
-      queuedAt: m.queuedAt.toISOString(),
-      startedAt: m.startedAt?.toISOString() ?? null,
-      completedAt: m.completedAt?.toISOString() ?? null,
-      cancelledAt: m.cancelledAt?.toISOString() ?? null,
-      cancellationReason: m.cancellationReason,
-      winnerTeam: m.winnerTeam,
-      currentRevisionId: m.currentRevisionId,
-      version: m.version,
-      participants: m.participants.map((p: any) => ({
-        id: p.id,
-        matchId: p.matchId,
-        queuePlayerId: p.queuePlayerId,
-        team: p.team,
-        teamSlot: p.teamSlot,
-        priorQueueEnteredAt: p.priorQueueEnteredAt?.toISOString() ?? null,
-      })),
-      scoreRevisions: m.scoreRevisions.map((r: any) => ({
-        id: r.id,
-        matchId: r.matchId,
-        revisionNumber: r.revisionNumber,
-        winnerTeam: r.winnerTeam,
-        reason: r.reason,
-        supersedesRevisionId: r.supersedesRevisionId,
-        createdAt: r.createdAt.toISOString(),
-        games: r.games.map((g: any) => ({
-          id: g.id,
-          scoreRevisionId: g.scoreRevisionId,
-          gameNumber: g.gameNumber,
-          teamAScore: g.teamAScore,
-          teamBScore: g.teamBScore,
-          winnerTeam: g.winnerTeam,
+    matches: matches.map((m: any) => {
+      const stored =
+        m.suggestionExplanation && typeof m.suggestionExplanation === "object"
+          ? (m.suggestionExplanation as Record<string, unknown>).__courtSnapshot
+          : null;
+      const courtSnapshot =
+        stored && typeof stored === "object" ? (stored as { id?: unknown; name?: unknown }) : null;
+      return {
+        id: m.id,
+        courtId: m.courtId,
+        courtIdSnapshot: m.courtIdSnapshot ?? (courtSnapshot?.id ? String(courtSnapshot.id) : null),
+        courtNameSnapshot:
+          m.courtNameSnapshot ?? (courtSnapshot?.name ? String(courtSnapshot.name) : null),
+        status: m.status,
+        source: m.source,
+        matchmakingMode: m.matchmakingMode,
+        algorithmVersion: m.algorithmVersion,
+        suggestionKey: m.suggestionKey,
+        suggestionExplanation: m.suggestionExplanation,
+        pointsToWin: m.pointsToWin,
+        winBy: m.winBy,
+        scoreCap: m.scoreCap,
+        bestOf: m.bestOf as 1 | 3,
+        queuedAt: m.queuedAt.toISOString(),
+        startedAt: m.startedAt?.toISOString() ?? null,
+        completedAt: m.completedAt?.toISOString() ?? null,
+        cancelledAt: m.cancelledAt?.toISOString() ?? null,
+        cancellationReason: m.cancellationReason,
+        winnerTeam: m.winnerTeam,
+        currentRevisionId: m.currentRevisionId,
+        version: m.version,
+        participants: m.participants.map((p: any) => ({
+          id: p.id,
+          matchId: p.matchId,
+          queuePlayerId: p.queuePlayerId,
+          team: p.team,
+          teamSlot: p.teamSlot,
+          priorQueueEnteredAt: p.priorQueueEnteredAt?.toISOString() ?? null,
         })),
-      })),
-    })),
+        scoreRevisions: m.scoreRevisions.map((r: any) => ({
+          id: r.id,
+          matchId: r.matchId,
+          revisionNumber: r.revisionNumber,
+          winnerTeam: r.winnerTeam,
+          reason: r.reason,
+          supersedesRevisionId: r.supersedesRevisionId,
+          createdAt: r.createdAt.toISOString(),
+          games: r.games.map((g: any) => ({
+            id: g.id,
+            scoreRevisionId: g.scoreRevisionId,
+            gameNumber: g.gameNumber,
+            teamAScore: g.teamAScore,
+            teamBScore: g.teamBScore,
+            winnerTeam: g.winnerTeam,
+          })),
+        })),
+      };
+    }),
     feeConfig: feeConfig
       ? {
           id: feeConfig.id,
@@ -5368,6 +5439,7 @@ api.put(
         schemaVersion: 2,
         alreadyApplied: result.alreadyApplied,
       });
+      releaseSyncUploadAdmission(request);
     } catch (error) {
       if (isUniqueConstraintError(error)) {
         const target =
@@ -5404,16 +5476,8 @@ api.put(
     }
   }),
 );
-async function snapshotWithMatchSnapshots(
-  snapshot: CloudSnapshotV2,
-  database = db,
-): Promise<CloudSnapshotV2> {
+async function snapshotWithMatchSnapshots(snapshot: CloudSnapshotV2): Promise<CloudSnapshotV2> {
   const normalized = normalizeQueuePlayerSnapshotFields(snapshot) as CloudSnapshotV2;
-  const rows = await database.match.findMany({
-    where: { queueMasterId: normalized.queueMasterId },
-    select: { id: true, courtIdSnapshot: true, courtNameSnapshot: true },
-  });
-  const byId = new Map<string, any>(rows.map((row: any) => [row.id, row] as [string, any]));
   return {
     ...normalized,
     matches: normalized.matches.map((match) => {
@@ -5425,14 +5489,8 @@ async function snapshotWithMatchSnapshots(
         stored && typeof stored === "object" ? (stored as { id?: unknown; name?: unknown }) : null;
       return {
         ...match,
-        courtIdSnapshot:
-          match.courtIdSnapshot ??
-          byId.get(match.id)?.courtIdSnapshot ??
-          (record?.id ? String(record.id) : null),
-        courtNameSnapshot:
-          match.courtNameSnapshot ??
-          byId.get(match.id)?.courtNameSnapshot ??
-          (record?.name ? String(record.name) : null),
+        courtIdSnapshot: match.courtIdSnapshot ?? (record?.id ? String(record.id) : null),
+        courtNameSnapshot: match.courtNameSnapshot ?? (record?.name ? String(record.name) : null),
       };
     }),
   };
@@ -5699,7 +5757,29 @@ export function createApp() {
     next();
   });
   app.use("/api/v2/public/rankings", publicRankingBody, publicRankingEdge);
+  app.use(
+    "/api/v2/sync/snapshot",
+    cookieParser(),
+    (request, response, next) => {
+      if (request.method !== "PUT") {
+        next();
+        return;
+      }
+      requireAuth(request, response, (error) => {
+        if (error) {
+          next(error);
+          return;
+        }
+        requireMutationOrigin(request, response, next);
+      });
+    },
+    createSyncUploadAdmission(),
+  );
   app.use(express.json({ limit: "25mb" }));
+  app.use((request, _response, next) => {
+    markSyncUploadBodyParsed(request);
+    next();
+  });
   app.use(cookieParser());
   app.get("/health", (_request, response) => response.json({ ok: true }));
   app.use("/api/v1", (_request, response) =>

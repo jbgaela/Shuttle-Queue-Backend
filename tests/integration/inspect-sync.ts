@@ -37,9 +37,25 @@ try {
         select: { cloudRevision: true, schemaVersion: true },
       }),
     ]);
-  console.log(
-    JSON.stringify({ players, queuePlayers, matches, courts, payments, receipts, audits, state }),
-  );
+  const summary = process.argv[3] === "--summary";
+  if (summary) {
+    console.log(
+      JSON.stringify({
+        players: players.length,
+        queuePlayers: queuePlayers.length,
+        matches: matches.length,
+        courts: courts.length,
+        payments: payments.length,
+        receipts,
+        audits,
+        state,
+      }),
+    );
+  } else {
+    console.log(
+      JSON.stringify({ players, queuePlayers, matches, courts, payments, receipts, audits, state }),
+    );
+  }
 } finally {
   await prisma.$disconnect();
 }

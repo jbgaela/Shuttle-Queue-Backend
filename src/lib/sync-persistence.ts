@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   mergeSyncSnapshots,
   mergeSyncMetadata,
@@ -114,9 +115,15 @@ export type SyncUpload = {
   auditEvents: Array<Record<string, unknown>>;
 };
 
-const duplicateValues = (values: string[]) => [
-  ...new Set(values.filter((value, index) => values.indexOf(value) !== index)),
-];
+const duplicateValues = (values: string[]) => {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) duplicates.add(value);
+    else seen.add(value);
+  }
+  return [...duplicates];
+};
 const assertUnique = (values: string[], entity: string, field: string) => {
   const duplicates = duplicateValues(values);
   if (duplicates.length)
@@ -360,24 +367,62 @@ export async function assertStableNaturalKeys(
   tx: SyncDatabase,
   queueMasterId: string,
   snapshot: CloudSnapshotV2,
+  currentSnapshot?: CloudSnapshotV2,
 ) {
-  const [players, queuePlayers, courts, participants, revisions, games] = await Promise.all([
-    tx.player.findMany({ where: { queueMasterId }, select: { id: true, displayName: true } }),
-    tx.queuePlayer.findMany({ where: { queueMasterId }, select: { id: true, playerId: true } }),
-    tx.court.findMany({ where: { queueMasterId }, select: { id: true, name: true } }),
-    tx.matchParticipant.findMany({
-      where: { match: { queueMasterId } },
-      select: { id: true, matchId: true, queuePlayerId: true, team: true, teamSlot: true },
-    }),
-    tx.matchScoreRevision.findMany({
-      where: { match: { queueMasterId } },
-      select: { id: true, matchId: true, revisionNumber: true },
-    }),
-    tx.matchGame.findMany({
-      where: { scoreRevision: { match: { queueMasterId } } },
-      select: { id: true, scoreRevisionId: true, gameNumber: true },
-    }),
-  ]);
+  let players: any[];
+  let queuePlayers: any[];
+  let courts: any[];
+  let participants: any[];
+  let revisions: any[];
+  let games: any[];
+  if (currentSnapshot) {
+    players = currentSnapshot.players.map(({ id, displayName }) => ({ id, displayName }));
+    queuePlayers = currentSnapshot.queuePlayers.map(({ id, playerId }) => ({ id, playerId }));
+    courts = currentSnapshot.courts.map(({ id, name }) => ({ id, name }));
+    participants = currentSnapshot.matches.flatMap((match) =>
+      match.participants.map(({ id, matchId, queuePlayerId, team, teamSlot }) => ({
+        id,
+        matchId,
+        queuePlayerId,
+        team,
+        teamSlot,
+      })),
+    );
+    revisions = currentSnapshot.matches.flatMap((match) =>
+      match.scoreRevisions.map(({ id, matchId, revisionNumber }) => ({
+        id,
+        matchId,
+        revisionNumber,
+      })),
+    );
+    games = currentSnapshot.matches.flatMap((match) =>
+      match.scoreRevisions.flatMap((revision) =>
+        revision.games.map(({ id, scoreRevisionId, gameNumber }) => ({
+          id,
+          scoreRevisionId,
+          gameNumber,
+        })),
+      ),
+    );
+  } else {
+    [players, queuePlayers, courts, participants, revisions, games] = await Promise.all([
+      tx.player.findMany({ where: { queueMasterId }, select: { id: true, displayName: true } }),
+      tx.queuePlayer.findMany({ where: { queueMasterId }, select: { id: true, playerId: true } }),
+      tx.court.findMany({ where: { queueMasterId }, select: { id: true, name: true } }),
+      tx.matchParticipant.findMany({
+        where: { match: { queueMasterId } },
+        select: { id: true, matchId: true, queuePlayerId: true, team: true, teamSlot: true },
+      }),
+      tx.matchScoreRevision.findMany({
+        where: { match: { queueMasterId } },
+        select: { id: true, matchId: true, revisionNumber: true },
+      }),
+      tx.matchGame.findMany({
+        where: { scoreRevision: { match: { queueMasterId } } },
+        select: { id: true, scoreRevisionId: true, gameNumber: true },
+      }),
+    ]);
+  }
   const playerByName = new Map(
     players.map((player: any) => [normalizeName(player.displayName), player.id]),
   );
@@ -739,13 +784,76 @@ const synergyTeamData = (team: NonNullable<CloudSnapshotV2["synergyTeams"]>[numb
   version: team.version,
 });
 
+const settingsData = (settings: NonNullable<CloudSnapshotV2["settings"]>) => ({
+  pointsToWin: settings.pointsToWin,
+  winBy: settings.winBy,
+  scoreCap: settings.scoreCap,
+  bestOf: settings.bestOf,
+  minimumRestMinutes: settings.minimumRestMinutes,
+  lateArrivalGraceMinutes: settings.lateArrivalGraceMinutes ?? DEFAULT_LATE_ARRIVAL_GRACE_MINUTES,
+  defaultFeeMode: settings.defaultFeeMode,
+  defaultFixedFeeMinor: settings.defaultFixedFeeMinor,
+  noShowPenaltyMinor: settings.noShowPenaltyMinor ?? 0,
+  currencyCode: settings.currencyCode,
+  timeZone: settings.timeZone,
+  defaultLateArrivalCutoffTime: settings.defaultLateArrivalCutoffTime,
+});
+
+const workspaceData = (workspace: CloudSnapshotV2["workspace"]) => ({
+  startedAt: new Date(workspace.startedAt),
+  endedAt: workspace.endedAt ? new Date(workspace.endedAt) : null,
+  lateArrivalCutoffAt: workspace.lateArrivalCutoffAt
+    ? new Date(workspace.lateArrivalCutoffAt)
+    : null,
+  matchmakingAlgorithm: workspace.matchmakingAlgorithm,
+  matchmakingRevision: workspace.matchmakingRevision,
+  version: workspace.version,
+});
+
+const feeConfigData = (feeConfig: NonNullable<CloudSnapshotV2["feeConfig"]>) => ({
+  mode: feeConfig.mode,
+  currencyCode: feeConfig.currencyCode,
+  fixedAmountPerPlayerMinor: feeConfig.fixedAmountPerPlayerMinor,
+  expectedQueueCostMinor: feeConfig.expectedQueueCostMinor,
+  noShowPenaltyMinor: feeConfig.noShowPenaltyMinor ?? 0,
+  participationRule: feeConfig.participationRule,
+  frozenAt: feeConfig.frozenAt ? new Date(feeConfig.frozenAt) : null,
+  version: feeConfig.version,
+});
+
+const sameIds = (existing: Set<string>, desired: string[]) =>
+  existing.size === desired.length && desired.every((id) => existing.has(id));
+
+const snapshotIds = (snapshot: CloudSnapshotV2) => ({
+  players: new Set(snapshot.players.map((row) => row.id)),
+  queuePlayers: new Set(snapshot.queuePlayers.map((row) => row.id)),
+  courts: new Set(snapshot.courts.map((row) => row.id)),
+  matches: new Set(snapshot.matches.map((row) => row.id)),
+  participants: new Set(
+    snapshot.matches.flatMap((match) => match.participants.map((row) => row.id)),
+  ),
+  revisions: new Set(
+    snapshot.matches.flatMap((match) => match.scoreRevisions.map((row) => row.id)),
+  ),
+  games: new Set(
+    snapshot.matches.flatMap((match) =>
+      match.scoreRevisions.flatMap((revision) => revision.games.map((row) => row.id)),
+    ),
+  ),
+  payments: new Set(snapshot.payments.map((row) => row.id)),
+  synergyTeams: new Set((snapshot.synergyTeams ?? []).map((row) => row.id)),
+});
+
 export async function reconcileSyncSnapshot(
   tx: SyncDatabase,
   queueMasterId: string,
   snapshot: CloudSnapshotV2,
   auditEvents: Array<Record<string, unknown>>,
   operationId: string,
-) {
+  currentSnapshot?: CloudSnapshotV2,
+): Promise<CloudSnapshotV2["audits"]> {
+  const insertedAuditRows: CloudSnapshotV2["audits"] = [];
+  const knownIds = currentSnapshot ? snapshotIds(currentSnapshot) : undefined;
   const ownedModels = [
     ["player", snapshot.players],
     ["queuePlayer", snapshot.queuePlayers],
@@ -754,10 +862,24 @@ export async function reconcileSyncSnapshot(
     ["payment", snapshot.payments],
     ["synergyTeam", snapshot.synergyTeams ?? []],
   ] as const;
+  const ownedKnownIds = {
+    player: knownIds?.players,
+    queuePlayer: knownIds?.queuePlayers,
+    court: knownIds?.courts,
+    match: knownIds?.matches,
+    payment: knownIds?.payments,
+    synergyTeam: knownIds?.synergyTeams,
+  };
   for (const [model, rows] of ownedModels) {
     if (!tx[model]?.findFirst || !rows.length) continue;
+    const known = ownedKnownIds[model];
+    const rowIds = rows.map((row: any) => row.id);
+    const uncheckedIds = known ? rowIds.filter((id) => !known.has(id)) : rowIds;
+    if (!uncheckedIds.length) continue;
     const foreign = await tx[model].findFirst({
-      where: { id: { in: rows.map((row: any) => row.id) }, queueMasterId: { not: queueMasterId } },
+      where: known
+        ? { id: { in: uncheckedIds } }
+        : { id: { in: uncheckedIds }, queueMasterId: { not: queueMasterId } },
       select: { id: true },
     });
     if (foreign)
@@ -787,8 +909,19 @@ export async function reconcileSyncSnapshot(
     ],
   ] as const) {
     if (!tx[model]?.findFirst || !rows.length) continue;
+    const known =
+      knownIds?.[
+        model === "matchParticipant"
+          ? "participants"
+          : model === "matchScoreRevision"
+            ? "revisions"
+            : "games"
+      ];
+    const rowIds = rows.map((row) => row.id);
+    const uncheckedIds = known ? rowIds.filter((id) => !known.has(id)) : rowIds;
+    if (!uncheckedIds.length) continue;
     const foreign = await tx[model].findFirst({
-      where: { id: { in: rows.map((row) => row.id) }, ...relation },
+      where: known ? { id: { in: uncheckedIds } } : { id: { in: uncheckedIds }, ...relation },
       select: { id: true },
     });
     if (foreign)
@@ -798,17 +931,53 @@ export async function reconcileSyncSnapshot(
         { entity: model },
       );
   }
-  const ids = await existingIds(tx, queueMasterId);
+  const currentRows = currentSnapshot
+    ? {
+        players: new Map(currentSnapshot.players.map((row) => [row.id, playerData(row)])),
+        queuePlayers: new Map(
+          currentSnapshot.queuePlayers.map((row) => [row.id, queuePlayerData(row)]),
+        ),
+        courts: new Map(currentSnapshot.courts.map((row) => [row.id, courtData(row)])),
+        matches: new Map(currentSnapshot.matches.map((row) => [row.id, matchData(row)])),
+        participants: new Map(
+          currentSnapshot.matches.flatMap((match) =>
+            match.participants.map((row) => [row.id, participantData(row)] as const),
+          ),
+        ),
+        revisions: new Map(
+          currentSnapshot.matches.flatMap((match) =>
+            match.scoreRevisions.map((row) => [row.id, revisionData(row, queueMasterId)] as const),
+          ),
+        ),
+        games: new Map(
+          currentSnapshot.matches.flatMap((match) =>
+            match.scoreRevisions.flatMap((revision) =>
+              revision.games.map((row) => [row.id, gameData(row)] as const),
+            ),
+          ),
+        ),
+        payments: new Map(currentSnapshot.payments.map((row) => [row.id, paymentData(row)])),
+        synergyTeams: new Map(
+          (currentSnapshot.synergyTeams ?? []).map((row) => [row.id, synergyTeamData(row)]),
+        ),
+      }
+    : undefined;
+  const ids = currentRows ? knownIds! : await existingIds(tx, queueMasterId);
   // Free changed natural keys before final writes, including name swaps.
   for (const [model, rows, field] of [
     ["player", snapshot.players, "displayName"],
     ["court", snapshot.courts, "name"],
   ] as const) {
     if (!tx[model]?.findFirst) continue;
-    const stored = await tx[model].findMany({
-      where: { queueMasterId },
-      select: { id: true, normalizedName: true },
-    });
+    const stored = currentSnapshot
+      ? (model === "player" ? currentSnapshot.players : currentSnapshot.courts).map((row: any) => ({
+          id: row.id,
+          normalizedName: normalizeName(row[field]),
+        }))
+      : await tx[model].findMany({
+          where: { queueMasterId },
+          select: { id: true, normalizedName: true },
+        });
     const byId = new Map(stored.map((row: any) => [row.id, row.normalizedName]));
     for (const row of rows)
       if (byId.has(row.id) && byId.get(row.id) !== normalizeName((row as any)[field])) {
@@ -823,48 +992,63 @@ export async function reconcileSyncSnapshot(
     id: string,
     data: unknown,
     exists: Set<string>,
+    currentData?: Map<string, unknown>,
     ownsQueueMaster = false,
-  ) =>
-    exists.has(id)
-      ? model.update({ where: { id }, data })
-      : model.create({
-          data: { id, ...(ownsQueueMaster ? { queueMasterId } : {}), ...(data as object) },
-        });
+  ) => {
+    if (exists.has(id)) {
+      if (currentData && isDeepStrictEqual(currentData.get(id), data)) return;
+      await model.update({ where: { id }, data });
+      return;
+    }
+    await model.create({
+      data: { id, ...(ownsQueueMaster ? { queueMasterId } : {}), ...(data as object) },
+    });
+  };
   for (const player of snapshot.players)
-    await write(tx.player, player.id, playerData(player), ids.players, true);
+    await write(tx.player, player.id, playerData(player), ids.players, currentRows?.players, true);
   for (const player of snapshot.queuePlayers)
-    await write(tx.queuePlayer, player.id, queuePlayerData(player), ids.queuePlayers, true);
+    await write(
+      tx.queuePlayer,
+      player.id,
+      queuePlayerData(player),
+      ids.queuePlayers,
+      currentRows?.queuePlayers,
+      true,
+    );
   for (const court of snapshot.courts)
-    await write(tx.court, court.id, courtData(court), ids.courts, true);
+    await write(tx.court, court.id, courtData(court), ids.courts, currentRows?.courts, true);
   for (const match of snapshot.matches)
-    await write(tx.match, match.id, matchData(match), ids.matches, true);
+    await write(tx.match, match.id, matchData(match), ids.matches, currentRows?.matches, true);
   const participantIds = snapshot.matches.flatMap((match) =>
     match.participants.map((participant) => participant.id),
   );
-  await tx.matchParticipant.deleteMany({
-    where: {
-      match: { queueMasterId },
-      ...(participantIds.length ? { id: { notIn: participantIds } } : {}),
-    },
-  });
+  if (!currentRows || !sameIds(ids.participants, participantIds))
+    await tx.matchParticipant.deleteMany({
+      where: {
+        match: { queueMasterId },
+        ...(participantIds.length ? { id: { notIn: participantIds } } : {}),
+      },
+    });
   const retainedRevisionIds = snapshot.matches.flatMap((match) =>
     match.scoreRevisions.map((revision) => revision.id),
   );
   const retainedGameIds = snapshot.matches.flatMap((match) =>
     match.scoreRevisions.flatMap((revision) => revision.games.map((game) => game.id)),
   );
-  await tx.matchGame.deleteMany({
-    where: {
-      scoreRevision: { match: { queueMasterId } },
-      ...(retainedGameIds.length ? { id: { notIn: retainedGameIds } } : {}),
-    },
-  });
-  await tx.matchScoreRevision.deleteMany({
-    where: {
-      match: { queueMasterId },
-      ...(retainedRevisionIds.length ? { id: { notIn: retainedRevisionIds } } : {}),
-    },
-  });
+  if (!currentRows || !sameIds(ids.games, retainedGameIds))
+    await tx.matchGame.deleteMany({
+      where: {
+        scoreRevision: { match: { queueMasterId } },
+        ...(retainedGameIds.length ? { id: { notIn: retainedGameIds } } : {}),
+      },
+    });
+  if (!currentRows || !sameIds(ids.revisions, retainedRevisionIds))
+    await tx.matchScoreRevision.deleteMany({
+      where: {
+        match: { queueMasterId },
+        ...(retainedRevisionIds.length ? { id: { notIn: retainedRevisionIds } } : {}),
+      },
+    });
   for (const match of snapshot.matches) {
     for (const participant of match.participants)
       await write(
@@ -872,6 +1056,7 @@ export async function reconcileSyncSnapshot(
         participant.id,
         participantData(participant),
         ids.participants,
+        currentRows?.participants,
       );
     for (const revision of match.scoreRevisions) {
       await write(
@@ -879,16 +1064,31 @@ export async function reconcileSyncSnapshot(
         revision.id,
         revisionData(revision, queueMasterId),
         ids.revisions,
+        currentRows?.revisions,
       );
       for (const game of revision.games)
-        await write(tx.matchGame, game.id, gameData(game), ids.games);
+        await write(tx.matchGame, game.id, gameData(game), ids.games, currentRows?.games);
     }
   }
   for (const payment of snapshot.payments)
-    await write(tx.payment, payment.id, paymentData(payment), ids.payments, true);
+    await write(
+      tx.payment,
+      payment.id,
+      paymentData(payment),
+      ids.payments,
+      currentRows?.payments,
+      true,
+    );
   if (tx.synergyTeam)
     for (const team of snapshot.synergyTeams ?? [])
-      await write(tx.synergyTeam, team.id, synergyTeamData(team), ids.synergyTeams, true);
+      await write(
+        tx.synergyTeam,
+        team.id,
+        synergyTeamData(team),
+        ids.synergyTeams,
+        currentRows?.synergyTeams,
+        true,
+      );
 
   const playerIds = snapshot.players.map((player) => player.id);
   const queuePlayerIds = snapshot.queuePlayers.map((player) => player.id);
@@ -902,98 +1102,86 @@ export async function reconcileSyncSnapshot(
   );
   const paymentIds = snapshot.payments.map((payment) => payment.id);
   const synergyTeamIds = (snapshot.synergyTeams ?? []).map((team) => team.id);
-  await tx.matchGame.deleteMany({
-    where: {
-      scoreRevision: { match: { queueMasterId } },
-      ...(gameIds.length ? { id: { notIn: gameIds } } : {}),
-    },
-  });
-  await tx.matchScoreRevision.deleteMany({
-    where: {
-      match: { queueMasterId },
-      ...(revisionIds.length ? { id: { notIn: revisionIds } } : {}),
-    },
-  });
-  await tx.match.deleteMany({
-    where: { queueMasterId, ...(matchIds.length ? { id: { notIn: matchIds } } : {}) },
-  });
-  await tx.payment.deleteMany({
-    where: { queueMasterId, ...(paymentIds.length ? { id: { notIn: paymentIds } } : {}) },
-  });
-  if (tx.synergyTeam)
-    await tx.synergyTeam.deleteMany({
-      where: { queueMasterId, ...(synergyTeamIds.length ? { id: { notIn: synergyTeamIds } } : {}) },
+  if (!currentRows || !sameIds(ids.games, gameIds))
+    await tx.matchGame.deleteMany({
+      where: {
+        scoreRevision: { match: { queueMasterId } },
+        ...(gameIds.length ? { id: { notIn: gameIds } } : {}),
+      },
     });
-  await tx.queuePlayer.deleteMany({
-    where: { queueMasterId, ...(queuePlayerIds.length ? { id: { notIn: queuePlayerIds } } : {}) },
-  });
-  await tx.court.deleteMany({
-    where: { queueMasterId, ...(courtIds.length ? { id: { notIn: courtIds } } : {}) },
-  });
-  await tx.player.deleteMany({
-    where: { queueMasterId, ...(playerIds.length ? { id: { notIn: playerIds } } : {}) },
-  });
+  if (!currentRows || !sameIds(ids.revisions, revisionIds))
+    await tx.matchScoreRevision.deleteMany({
+      where: {
+        match: { queueMasterId },
+        ...(revisionIds.length ? { id: { notIn: revisionIds } } : {}),
+      },
+    });
+  if (!currentRows || !sameIds(ids.matches, matchIds))
+    await tx.match.deleteMany({
+      where: { queueMasterId, ...(matchIds.length ? { id: { notIn: matchIds } } : {}) },
+    });
+  if (!currentRows || !sameIds(ids.payments, paymentIds))
+    await tx.payment.deleteMany({
+      where: { queueMasterId, ...(paymentIds.length ? { id: { notIn: paymentIds } } : {}) },
+    });
+  if (tx.synergyTeam)
+    if (!currentRows || !sameIds(ids.synergyTeams, synergyTeamIds))
+      await tx.synergyTeam.deleteMany({
+        where: {
+          queueMasterId,
+          ...(synergyTeamIds.length ? { id: { notIn: synergyTeamIds } } : {}),
+        },
+      });
+  if (!currentRows || !sameIds(ids.queuePlayers, queuePlayerIds))
+    await tx.queuePlayer.deleteMany({
+      where: { queueMasterId, ...(queuePlayerIds.length ? { id: { notIn: queuePlayerIds } } : {}) },
+    });
+  if (!currentRows || !sameIds(ids.courts, courtIds))
+    await tx.court.deleteMany({
+      where: { queueMasterId, ...(courtIds.length ? { id: { notIn: courtIds } } : {}) },
+    });
+  if (!currentRows || !sameIds(ids.players, playerIds))
+    await tx.player.deleteMany({
+      where: { queueMasterId, ...(playerIds.length ? { id: { notIn: playerIds } } : {}) },
+    });
 
-  if (snapshot.settings)
+  if (
+    snapshot.settings &&
+    (!currentSnapshot ||
+      !isDeepStrictEqual(
+        currentSnapshot.settings && settingsData(currentSnapshot.settings),
+        settingsData(snapshot.settings),
+      ))
+  )
     await tx.queueMasterSettings.update({
       where: { queueMasterId },
-      data: {
-        pointsToWin: snapshot.settings.pointsToWin,
-        winBy: snapshot.settings.winBy,
-        scoreCap: snapshot.settings.scoreCap,
-        bestOf: snapshot.settings.bestOf,
-        minimumRestMinutes: snapshot.settings.minimumRestMinutes,
-        lateArrivalGraceMinutes:
-          snapshot.settings.lateArrivalGraceMinutes ?? DEFAULT_LATE_ARRIVAL_GRACE_MINUTES,
-        defaultFeeMode: snapshot.settings.defaultFeeMode,
-        defaultFixedFeeMinor: snapshot.settings.defaultFixedFeeMinor,
-        noShowPenaltyMinor: snapshot.settings.noShowPenaltyMinor ?? 0,
-        currencyCode: snapshot.settings.currencyCode,
-        timeZone: snapshot.settings.timeZone,
-        defaultLateArrivalCutoffTime: snapshot.settings.defaultLateArrivalCutoffTime,
-      },
+      data: settingsData(snapshot.settings),
     });
-  await tx.queueWorkspace.update({
-    where: { queueMasterId },
-    data: {
-      startedAt: new Date(snapshot.workspace.startedAt),
-      endedAt: snapshot.workspace.endedAt ? new Date(snapshot.workspace.endedAt) : null,
-      lateArrivalCutoffAt: snapshot.workspace.lateArrivalCutoffAt
-        ? new Date(snapshot.workspace.lateArrivalCutoffAt)
-        : null,
-      matchmakingAlgorithm: snapshot.workspace.matchmakingAlgorithm,
-      matchmakingRevision: snapshot.workspace.matchmakingRevision,
-      version: snapshot.workspace.version,
-    },
-  });
-  if (snapshot.feeConfig)
+  if (
+    !currentSnapshot ||
+    !isDeepStrictEqual(workspaceData(currentSnapshot.workspace), workspaceData(snapshot.workspace))
+  )
+    await tx.queueWorkspace.update({
+      where: { queueMasterId },
+      data: workspaceData(snapshot.workspace),
+    });
+  if (
+    snapshot.feeConfig &&
+    (!currentSnapshot ||
+      !isDeepStrictEqual(
+        currentSnapshot.feeConfig ? feeConfigData(currentSnapshot.feeConfig) : null,
+        feeConfigData(snapshot.feeConfig),
+      ))
+  )
     await tx.queueFeeConfig.upsert({
       where: { queueMasterId },
-      create: {
-        queueMasterId,
-        mode: snapshot.feeConfig.mode,
-        currencyCode: snapshot.feeConfig.currencyCode,
-        fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor,
-        expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor,
-        noShowPenaltyMinor: snapshot.feeConfig.noShowPenaltyMinor ?? 0,
-        participationRule: snapshot.feeConfig.participationRule,
-        frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null,
-        version: snapshot.feeConfig.version,
-      },
-      update: {
-        mode: snapshot.feeConfig.mode,
-        currencyCode: snapshot.feeConfig.currencyCode,
-        fixedAmountPerPlayerMinor: snapshot.feeConfig.fixedAmountPerPlayerMinor,
-        expectedQueueCostMinor: snapshot.feeConfig.expectedQueueCostMinor,
-        noShowPenaltyMinor: snapshot.feeConfig.noShowPenaltyMinor ?? 0,
-        participationRule: snapshot.feeConfig.participationRule,
-        frozenAt: snapshot.feeConfig.frozenAt ? new Date(snapshot.feeConfig.frozenAt) : null,
-        version: snapshot.feeConfig.version,
-      },
+      create: { queueMasterId, ...feeConfigData(snapshot.feeConfig) },
+      update: feeConfigData(snapshot.feeConfig),
     });
-  else await tx.queueFeeConfig.deleteMany({ where: { queueMasterId } });
-  for (const event of auditEvents)
-    await tx.auditLog.create({
+  else if (!snapshot.feeConfig && (!currentSnapshot || currentSnapshot.feeConfig))
+    await tx.queueFeeConfig.deleteMany({ where: { queueMasterId } });
+  for (const event of auditEvents) {
+    const created = await tx.auditLog.create({
       data: {
         queueMasterId,
         action: typeof event.action === "string" ? event.action : "OFFLINE_EVENT",
@@ -1005,6 +1193,20 @@ export async function reconcileSyncSnapshot(
         requestId: `offline:${operationId}`,
       },
     });
+    if (created?.id && created?.createdAt)
+      insertedAuditRows.push({
+        id: created.id,
+        action: created.action,
+        entityType: created.entityType,
+        entityId: created.entityId,
+        reason: created.reason,
+        beforeJson: created.beforeJson,
+        afterJson: created.afterJson,
+        requestId: created.requestId,
+        createdAt: new Date(created.createdAt).toISOString(),
+      });
+  }
+  return insertedAuditRows;
 }
 
 export async function persistSyncSnapshot(
@@ -1083,7 +1285,7 @@ export async function persistSyncSnapshot(
     );
     const merged = mergeSyncSnapshots(review.snapshot, review.snapshot, metadata, metadata);
     validateSyncSnapshot(merged.snapshot);
-    await assertStableNaturalKeys(tx, queueMasterId, merged.snapshot);
+    await assertStableNaturalKeys(tx, queueMasterId, merged.snapshot, current.snapshot);
     const claimed = await tx.accountSyncState.updateMany({
       where: { id: state.id, version: state.version },
       data: {
@@ -1120,12 +1322,13 @@ export async function persistSyncSnapshot(
         finalSnapshot,
       );
     }
-    await reconcileSyncSnapshot(
+    const insertedAuditRows = await reconcileSyncSnapshot(
       tx,
       queueMasterId,
       merged.snapshot,
       upload.auditEvents,
       upload.operationId,
+      readCurrent ? current.snapshot : undefined,
     );
     if (!sessionChanged && merged.snapshot.workspace.endedAt)
       await refreshFinalizedPublicRankingFromSnapshot(
@@ -1134,7 +1337,15 @@ export async function persistSyncSnapshot(
         mergedStartedAt,
         merged.snapshot,
       );
-    const persisted = readCurrent ? await readCurrent(tx) : { snapshot: merged.snapshot };
+    const persisted =
+      readCurrent && (sessionChanged || Boolean(merged.snapshot.workspace.endedAt))
+        ? await readCurrent(tx)
+        : {
+            snapshot: {
+              ...merged.snapshot,
+              audits: [...merged.snapshot.audits, ...insertedAuditRows],
+            },
+          };
     const persistedMetadata = stampSnapshotChanges(
       merged.snapshot,
       persisted.snapshot,
@@ -1221,6 +1432,7 @@ export async function persistSyncSnapshot(
     upload.snapshot,
     upload.auditEvents,
     upload.operationId,
+    readCurrent ? current.snapshot : undefined,
   );
   if (!sessionChanged && upload.snapshot.workspace.endedAt)
     await refreshFinalizedPublicRankingFromSnapshot(

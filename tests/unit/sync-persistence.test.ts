@@ -516,6 +516,7 @@ test("merges and persists a replacement lineup in one sync operation", async () 
     queuePlayer: {
       findMany: async () => [],
       create: async () => calls.push("queue-player-create"),
+      update: async () => calls.push("queue-player-update"),
       deleteMany: async () => ({}),
     },
     court: {
@@ -526,6 +527,7 @@ test("merges and persists a replacement lineup in one sync operation", async () 
     match: {
       findMany: async () => [],
       create: async () => calls.push("match-create"),
+      update: async () => calls.push("match-update"),
       deleteMany: async () => ({}),
     },
     matchParticipant: {

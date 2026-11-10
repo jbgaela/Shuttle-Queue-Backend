@@ -1,4 +1,46 @@
+import { QueuePlayerStatus } from "@prisma/client";
+import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 import { skillWeight, type SkillLevel } from "@shuttle-queue/domain";
+import { badRequest } from "./errors.js";
+
+export function snapshotQueueSummaries(snapshot: CloudSnapshotV2) {
+  const activeMatchByPlayer = new Map<string, string>();
+  const queuedMatchByPlayer = new Map<string, { id: string; queuedAt: string }>();
+  for (const match of snapshot.matches) {
+    const queuePlayerIds = new Set(
+      match.participants.map((participant) => participant.queuePlayerId),
+    );
+    for (const queuePlayerId of queuePlayerIds) {
+      if (match.status === "IN_PROGRESS") {
+        const existingMatchId = activeMatchByPlayer.get(queuePlayerId);
+        if (existingMatchId && existingMatchId !== match.id)
+          throw badRequest("A player cannot be in more than one active match.");
+        activeMatchByPlayer.set(queuePlayerId, match.id);
+      } else if (match.status === "QUEUED") {
+        const queued = queuedMatchByPlayer.get(queuePlayerId);
+        if (
+          !queued ||
+          match.queuedAt.localeCompare(queued.queuedAt) < 0 ||
+          (match.queuedAt === queued.queuedAt && match.id.localeCompare(queued.id) < 0)
+        )
+          queuedMatchByPlayer.set(queuePlayerId, { id: match.id, queuedAt: match.queuedAt });
+      }
+    }
+  }
+  const summaries = new Map<string, { status: QueuePlayerStatus; currentMatchId: string | null }>();
+  for (const [queuePlayerId, matchId] of activeMatchByPlayer)
+    summaries.set(queuePlayerId, {
+      status: QueuePlayerStatus.PLAYING,
+      currentMatchId: matchId,
+    });
+  for (const [queuePlayerId, match] of queuedMatchByPlayer)
+    if (!activeMatchByPlayer.has(queuePlayerId))
+      summaries.set(queuePlayerId, {
+        status: QueuePlayerStatus.QUEUED,
+        currentMatchId: match.id,
+      });
+  return summaries;
+}
 
 export function stalePlayerFilter(playerIds: string[]) {
   return playerIds.length ? { id: { notIn: playerIds } } : {};

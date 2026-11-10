@@ -80,6 +80,23 @@ after(async () => {
   await prisma.$disconnect();
 });
 
+test("real MongoDB: sync snapshots negotiate gzip without changing the envelope", async () => {
+  const client = clients[0];
+  const response = await fetch(`${url}/api/v2/sync/snapshot`, {
+    headers: {
+      cookie: client.cookie,
+      origin: "http://localhost:3100",
+      "accept-encoding": "gzip",
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-encoding"), "gzip");
+  const payload: any = await response.json();
+  assert.equal(payload.data.schemaVersion, 2);
+  assert.equal(payload.data.snapshot.queueMasterId, client.id);
+  assert.equal(typeof payload.requestId, "string");
+});
+
 test("real MongoDB: ten successive snapshots and accepted-operation replay", async () => {
   const client = clients[0];
   for (let cycle = 0; cycle < 10; cycle += 1) {
@@ -464,6 +481,14 @@ test("real MongoDB: ten pairs of simultaneous uploads merge with one receipt and
       }),
     ]);
     for (const result of results) assert.equal(result.status, 200, JSON.stringify(result));
+    for (const result of results)
+      assert.ok(
+        result.data.snapshot.audits.some(
+          (event: any) =>
+            event.action === "PARALLEL_UPLOAD" &&
+            additions.some((addition) => addition.id === event.entityId),
+        ),
+      );
     assert.equal(
       await prisma.player.count({
         where: { queueMasterId: client.id, id: { in: additions.map((row) => row.id) } },
