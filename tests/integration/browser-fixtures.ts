@@ -26,6 +26,7 @@ try {
       "idb-write-failure",
       "version-update",
       "ui-continuity",
+      "ui-offline-controls",
       ...(browser === "chromium" ? ["sync-deadline"] : []),
       ...Array.from({ length: 20 }, (_, index) => `load-${String(index + 1).padStart(2, "0")}`),
     ]) {
@@ -42,7 +43,11 @@ try {
         },
       });
       const seededAt = new Date();
-      const playerCount = scenario.startsWith("load-") ? 100 : 4;
+      const playerCount = scenario.startsWith("load-")
+        ? 100
+        : scenario === "ui-offline-controls"
+          ? 12
+          : 4;
       const playerIds = Array.from({ length: playerCount }, () => randomUUID());
       const queueIds = Array.from({ length: playerCount }, () => randomUUID());
       await prisma.player.createMany({
