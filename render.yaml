@@ -7,7 +7,7 @@ services:
     buildCommand: npm ci --include=dev && npm run build
     preDeployCommand: npm run prisma:push -- --skip-generate && npm run setup:ranking-tracking
     startCommand: npm run start
-    healthCheckPath: /health/ready
+    healthCheckPath: /health
     envVars:
       - key: PUBLIC_RANKING_EDGE_SECRET
         sync: false
