@@ -17,6 +17,59 @@ import { publicRankingSnapshotFromCloudSnapshot } from "./public-rankings.js";
 type SyncDatabase = any;
 const DEFAULT_LATE_ARRIVAL_GRACE_MINUTES = 10;
 
+export function protectSessionScoring(incoming: CloudSnapshotV2, current: CloudSnapshotV2) {
+  const sameSession = incoming.workspace.startedAt === current.workspace.startedAt;
+  if (
+    sameSession &&
+    incoming.workspace.scoringTarget == null &&
+    current.workspace.scoringTarget != null
+  )
+    incoming.workspace.scoringTarget = current.workspace.scoringTarget;
+  const target = incoming.workspace.scoringTarget;
+  if (
+    sameSession &&
+    current.matches.length &&
+    target !== current.workspace.scoringTarget &&
+    !(target == null && current.workspace.scoringTarget == null)
+  )
+    throw conflict(
+      "SCORING_LOCKED",
+      "Scoring was locked by a match on another device. Review the session changes and keep its original scoring. Pending work is preserved.",
+    );
+  const existing = new Map(sameSession ? current.matches.map((match) => [match.id, match]) : []);
+  for (const match of incoming.matches) {
+    const saved = existing.get(match.id);
+    if (saved) {
+      if (
+        ["pointsToWin", "winBy", "scoreCap", "bestOf"].some(
+          (field) => match[field as "pointsToWin"] !== saved[field as "pointsToWin"],
+        )
+      )
+        throw conflict(
+          "SYNC_SCORING_CONFLICT",
+          "An existing match must keep its saved scoring rules. Review the match changes before syncing. Pending work is preserved.",
+        );
+      continue;
+    }
+    if (target == null && (!sameSession || !current.matches.length))
+      throw conflict(
+        "SCORING_SETUP_REQUIRED",
+        "Choose scoring before syncing new matches. Pending work is preserved.",
+      );
+    if (
+      target != null &&
+      (match.pointsToWin !== target ||
+        match.winBy !== 1 ||
+        (match.scoreCap ?? match.pointsToWin) !== target ||
+        match.bestOf !== 1)
+    )
+      throw conflict(
+        "SYNC_SCORING_CONFLICT",
+        "A new match uses a different scoring target. Review the session and match changes before syncing. Pending work is preserved.",
+      );
+  }
+}
+
 export function publicRankingRowsFromSnapshot(snapshot: CloudSnapshotV2) {
   return publicRankingSnapshotFromCloudSnapshot(snapshot, snapshot.queueMasterId, new Date())
     .rankings;
@@ -800,6 +853,7 @@ const settingsData = (settings: NonNullable<CloudSnapshotV2["settings"]>) => ({
 });
 
 const workspaceData = (workspace: CloudSnapshotV2["workspace"]) => ({
+  scoringTarget: workspace.scoringTarget ?? null,
   startedAt: new Date(workspace.startedAt),
   endedAt: workspace.endedAt ? new Date(workspace.endedAt) : null,
   lateArrivalCutoffAt: workspace.lateArrivalCutoffAt
@@ -1284,6 +1338,7 @@ export async function persistSyncSnapshot(
       state.cloudRevision + 1,
     );
     const merged = mergeSyncSnapshots(review.snapshot, review.snapshot, metadata, metadata);
+    protectSessionScoring(merged.snapshot, current.snapshot);
     validateSyncSnapshot(merged.snapshot);
     await assertStableNaturalKeys(tx, queueMasterId, merged.snapshot, current.snapshot);
     const claimed = await tx.accountSyncState.updateMany({
@@ -1409,6 +1464,7 @@ export async function persistSyncSnapshot(
       cloudRevision: state.cloudRevision,
     });
   const current = readCurrent ? await readCurrent(tx) : { snapshot: upload.snapshot };
+  protectSessionScoring(upload.snapshot, current.snapshot);
   const sessionChanged =
     current.snapshot.workspace.startedAt !== upload.snapshot.workspace.startedAt;
   const sessionEnded =

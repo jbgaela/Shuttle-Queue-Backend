@@ -48,7 +48,7 @@ const upload = (client: (typeof clients)[number], remote: any, snapshot: any, ex
 before(async () => {
   if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
   url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  for (let index = 0; index < 2; index += 1) {
+  for (let index = 0; index < 3; index += 1) {
     const username = `docker-sync-${index}`;
     const account = await prisma.queueMaster.create({
       data: {
@@ -78,6 +78,113 @@ before(async () => {
 after(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   await prisma.$disconnect();
+});
+
+test("real MongoDB: session scoring validates targets, versions, locks, and atomic fresh queues", async () => {
+  const client = clients[2];
+  let workspace = (await call(client, "/workspace")).data;
+  assert.equal(workspace.scoringSetupRequired, true);
+  const blocked = await call(
+    client,
+    "/matches",
+    { teamA: [randomUUID()], teamB: [randomUUID()] },
+    "POST",
+  );
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.error.code, "SCORING_SETUP_REQUIRED");
+  for (const pointsToWin of [0, 100, 2.5, "21", null]) {
+    const invalid = await call(client, "/workspace/scoring", { pointsToWin }, "PATCH", {
+      "if-match": String(workspace.version),
+    });
+    assert.equal(invalid.status, 422);
+  }
+  const configured = await call(client, "/workspace/scoring", { pointsToWin: 21 }, "PATCH", {
+    "if-match": String(workspace.version),
+  });
+  assert.equal(configured.status, 200, JSON.stringify(configured));
+  assert.deepEqual(configured.data.scoring, { pointsToWin: 21, winBy: 1, scoreCap: 21, bestOf: 1 });
+  const stale = await call(client, "/workspace/scoring", { pointsToWin: 15 }, "PATCH", {
+    "if-match": String(workspace.version),
+  });
+  assert.equal(stale.status, 409);
+  workspace = configured.data;
+  const match = await prisma.match.create({
+    data: {
+      queueMasterId: client.id,
+      source: "MANUAL",
+      status: "CANCELLED",
+      pointsToWin: 21,
+      winBy: 1,
+      scoreCap: 21,
+      bestOf: 1,
+    },
+  });
+  const locked = await call(client, "/workspace/scoring", { pointsToWin: 15 }, "PATCH", {
+    "if-match": String(workspace.version),
+  });
+  assert.equal(locked.status, 409);
+  assert.equal(locked.error.code, "SCORING_LOCKED");
+  assert.equal((await call(client, "/workspace")).data.scoringLocked, true);
+  const invalidReset = await call(client, "/workspace/start-fresh", { pointsToWin: 0 }, "POST", {
+    "if-match": String(workspace.version),
+  });
+  assert.equal(invalidReset.status, 422);
+  assert.ok(await prisma.match.findUnique({ where: { id: match.id } }));
+  const reset = await call(client, "/workspace/start-fresh", { pointsToWin: 15 }, "POST", {
+    "if-match": String(workspace.version),
+  });
+  assert.equal(reset.status, 200, JSON.stringify(reset));
+  assert.equal(reset.data.scoringTarget, 15);
+  assert.equal(reset.data.scoringLocked, false);
+  assert.equal(await prisma.match.count({ where: { queueMasterId: client.id } }), 0);
+  const queueIds: string[] = [];
+  for (const name of ["Scoring A", "Scoring B"]) {
+    const player = await prisma.player.create({
+      data: {
+        queueMasterId: client.id,
+        displayName: name,
+        normalizedName: name.toLowerCase(),
+        gender: "MALE",
+        skillLevel: "BEGINNER",
+        skillWeight: 2,
+      },
+    });
+    const queued = await prisma.queuePlayer.create({
+      data: {
+        queueMasterId: client.id,
+        playerId: player.id,
+        displayNameSnapshot: name,
+        normalizedNameSnapshot: name.toLowerCase(),
+        genderSnapshot: "MALE",
+        skillLevelSnapshot: "BEGINNER",
+        skillWeightSnapshot: 2,
+        status: "WAITING",
+      },
+    });
+    queueIds.push(queued.id);
+  }
+  const [change, created] = await Promise.all([
+    call(client, "/workspace/scoring", { pointsToWin: 21 }, "PATCH", {
+      "if-match": String(reset.data.version),
+    }),
+    call(client, "/matches", { teamA: [queueIds[0]], teamB: [queueIds[1]] }, "POST"),
+  ]);
+  assert.ok([200, 409].includes(change.status), JSON.stringify(change));
+  assert.equal(created.status, 201, JSON.stringify(created));
+  workspace = (await call(client, "/workspace")).data;
+  assert.equal(created.data.scoring.pointsToWin, workspace.scoringTarget);
+  const ended = await call(client, "/workspace/end", {}, "POST", {
+    "if-match": String(workspace.version),
+  });
+  assert.equal(ended.status, 200, JSON.stringify(ended));
+  const endedChange = await call(client, "/workspace/scoring", { pointsToWin: 31 }, "PATCH", {
+    "if-match": String(ended.data.version),
+  });
+  assert.equal(endedChange.status, 409);
+  const unconfigured = await call(client, "/workspace/start-fresh", {}, "POST", {
+    "if-match": String(ended.data.version),
+  });
+  assert.equal(unconfigured.data.scoringSetupRequired, true);
 });
 
 test("real MongoDB: sync snapshots negotiate gzip without changing the envelope", async () => {
@@ -271,6 +378,7 @@ test("real MongoDB: conflicting offline scores can be reviewed without revision-
       version: 1,
     },
   ];
+  snapshot.workspace.scoringTarget = 31;
   snapshot.matches = [
     {
       id: matchId,
@@ -285,7 +393,7 @@ test("real MongoDB: conflicting offline scores can be reviewed without revision-
       suggestionExplanation: null,
       pointsToWin: 31,
       winBy: 1,
-      scoreCap: null,
+      scoreCap: 31,
       bestOf: 1,
       queuedAt: at,
       startedAt: at,

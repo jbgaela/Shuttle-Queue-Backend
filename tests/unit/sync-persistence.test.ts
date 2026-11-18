@@ -3,6 +3,7 @@ import test from "node:test";
 import type { CloudSnapshotV2 } from "@shuttle-queue/domain";
 import {
   assertStableNaturalKeys,
+  protectSessionScoring,
   persistSyncSnapshot,
   reconcileSyncSnapshot,
   validateSyncSnapshot,
@@ -36,6 +37,28 @@ const snapshot = (): CloudSnapshotV2 => ({
   feeConfig: null,
   payments: [],
   audits: [],
+});
+
+test("scoring sync preserves confirmed targets and rejects incompatible new matches", () => {
+  const current = snapshot();
+  current.workspace.scoringTarget = 21;
+  const incoming = snapshot();
+  protectSessionScoring(incoming, current);
+  assert.equal(incoming.workspace.scoringTarget, 21);
+  incoming.matches = [{ id: "new", pointsToWin: 31, winBy: 1, scoreCap: 31, bestOf: 1 } as any];
+  assert.throws(
+    () => protectSessionScoring(incoming, current),
+    (error: any) => error.code === "SYNC_SCORING_CONFLICT",
+  );
+  incoming.matches[0].pointsToWin = 21;
+  incoming.matches[0].scoreCap = 21;
+  protectSessionScoring(incoming, current);
+  current.matches = structuredClone(incoming.matches);
+  incoming.workspace.scoringTarget = 15;
+  assert.throws(
+    () => protectSessionScoring(incoming, current),
+    (error: any) => error.code === "SCORING_LOCKED",
+  );
 });
 
 test("validates duplicate and missing snapshot identities before persistence", () => {

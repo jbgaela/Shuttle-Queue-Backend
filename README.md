@@ -13,6 +13,12 @@ npm run dev
 
 Render runs `prisma:push` as the pre-deploy step so additive schema changes, including public ranking publications, are applied before the new service starts.
 
+## Session scoring rollout
+
+Deploy backend support for the nullable `QueueWorkspace.scoringTarget` field before the frontend. This additive change needs no historical-score backfill; retain the field on application rollback. Existing sessions with matches keep their saved rules. Empty sessions require scoring setup before match creation.
+
+`PATCH /api/v2/workspace/scoring` accepts `{ "pointsToWin": 21 }` with the current workspace `If-Match` version. Targets are integers from 1–99 and lock after the first match. `POST /api/v2/workspace/start-fresh` accepts the same optional target and resets the queue atomically; an empty body leaves scoring unconfigured. Workspace responses include `scoringTarget`, `scoringSetupRequired`, and `scoringLocked` alongside `scoring`. Snapshot sync preserves confirmed targets from older clients and rejects conflicting match rules while preserving pending work.
+
 ## Ranking link tracking rollout
 
 Public ranking traffic is forwarded by the frontend Netlify Edge Function. Set the same random, server-only `PUBLIC_RANKING_EDGE_SECRET` (at least 32 characters) on Netlify and Render before deploying this blueprint. The secret remains a non-synchronized Render setting. The blueprint declares `PUBLIC_RANKING_ACCESS_ENABLED=true` and `PUBLIC_RANKING_LOCATION_REQUIRED=true` so later Blueprint synchronization cannot silently disable an activated service. Production public-ranking requests without a valid signature are rejected. Development requests use the socket IP with no approximate location.

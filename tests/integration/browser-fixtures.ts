@@ -8,6 +8,7 @@ try {
   const hash = await passwordHash(process.env.SYNC_TEST_PASSWORD!);
   for (const browser of ["chromium", "firefox", "webkit"])
     for (const scenario of [
+      "scoring",
       "cycles",
       "replay",
       "inflight",
@@ -38,7 +39,7 @@ try {
           normalizedUsername: username,
           passwordHash: hash,
           settings: { create: {} },
-          workspace: { create: {} },
+          workspace: { create: { scoringTarget: scenario === "scoring" ? null : 31 } },
           feeConfig: { create: { mode: "FIXED_PER_PLAYER", fixedAmountPerPlayerMinor: 5000 } },
         },
       });

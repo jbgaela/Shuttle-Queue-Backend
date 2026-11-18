@@ -167,6 +167,7 @@ model QueueMasterSettings {
 }
 
 model QueueWorkspace {
+  scoringTarget          Int?
   queueMasterId          String      @id @map("_id")
   queueMaster            QueueMaster @relation(fields: [queueMasterId], references: [id])
   startedAt              DateTime    @default(now())

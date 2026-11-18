@@ -1,3 +1,4 @@
+import { sessionScoring, scoringState } from "@shuttle-queue/domain";
 import { createHash, randomUUID } from "node:crypto";
 import { gzip } from "node:zlib";
 import express, {
@@ -216,6 +217,7 @@ const cloudSnapshotSchema = z.strictObject({
     })
     .nullable(),
   workspace: z.strictObject({
+    scoringTarget: z.number().int().min(1).max(99).nullable().optional(),
     startedAt: z.string().datetime(),
     endedAt: z.string().datetime().nullable().optional(),
     lateArrivalCutoffAt: z.string().datetime().nullable(),
@@ -1570,7 +1572,8 @@ function workspaceView(workspace: any, settings: any, counts: any, feeConfig?: a
     version: workspace.version,
     playerCount: counts?.queuePlayers ?? 0,
     courtCount: counts?.courts ?? 0,
-    scoring: scoreSettings(settings),
+    ...scoringState(workspace.scoringTarget, counts?.matches ?? 0, Boolean(workspace.endedAt)),
+    scoring: sessionScoring(workspace.scoringTarget, scoreSettings(settings)),
     feeConfig: feeConfig
       ? {
           id: feeConfig.id,
@@ -2153,12 +2156,55 @@ api.get(
     const { settings, workspace } = await ensureWorkspace(authUser(request).id);
     const counts = await db.queueMaster.findUnique({
       where: { id: authUser(request).id },
-      select: { _count: { select: { queuePlayers: true, courts: true } } },
+      select: { _count: { select: { queuePlayers: true, courts: true, matches: true } } },
     });
     const fee = await db.queueFeeConfig.findUnique({
       where: { queueMasterId: authUser(request).id },
     });
     responseData(response, workspaceView(workspace, settings, counts?._count, fee));
+  }),
+);
+api.patch(
+  "/workspace/scoring",
+  requireAuth,
+  requireMutationOrigin,
+  route(async (request, response) => {
+    const queueMasterId = authUser(request).id;
+    const body = parse(z.object({ pointsToWin: z.number().int().min(1).max(99) }), request.body);
+    await ensureWorkspace(queueMasterId);
+    const updated = await withTransactionRetry(async (tx) => {
+      const workspace = await tx.queueWorkspace.findUniqueOrThrow({ where: { queueMasterId } });
+      assertVersion(workspace.version, versionFrom(request));
+      if (workspace.endedAt)
+        throw conflict("SESSION_ENDED", "Ended sessions cannot change scoring.");
+      if (await tx.match.count({ where: { queueMasterId } }))
+        throw conflict(
+          "SCORING_LOCKED",
+          "Scoring is locked after the first match. Start a fresh queue to change it.",
+        );
+      return tx.queueWorkspace.update({
+        where: { queueMasterId, version: workspace.version },
+        data: {
+          scoringTarget: body.pointsToWin,
+          version: { increment: 1 },
+          matchmakingRevision: { increment: 1 },
+        },
+      });
+    });
+    const settings = await db.queueMasterSettings.findUnique({ where: { queueMasterId } });
+    const counts = await db.queueMaster.findUnique({
+      where: { id: queueMasterId },
+      select: { _count: { select: { queuePlayers: true, courts: true, matches: true } } },
+    });
+    responseData(
+      response,
+      workspaceView(
+        updated,
+        settings,
+        counts?._count,
+        await db.queueFeeConfig.findUnique({ where: { queueMasterId } }),
+      ),
+    );
   }),
 );
 api.post(
@@ -2167,6 +2213,10 @@ api.post(
   requireMutationOrigin,
   route(async (request, response) => {
     const queueMasterId = authUser(request).id;
+    const body = parse(
+      z.object({ pointsToWin: z.number().int().min(1).max(99).optional() }),
+      request.body ?? {},
+    );
     const current = await db.queueWorkspace.findUnique({ where: { queueMasterId } });
     if (!current) {
       await ensureWorkspace(queueMasterId);
@@ -2210,6 +2260,7 @@ api.post(
         where: { queueMasterId, version: expected },
         data: {
           startedAt: resetAt,
+          scoringTarget: body.pointsToWin ?? null,
           endedAt: null,
           lateArrivalCutoffAt: null,
           matchmakingRevision: { increment: 1 },
@@ -2352,7 +2403,7 @@ api.patch(
     });
     const account = await db.queueMaster.findUnique({
       where: { id: queueMasterId },
-      select: { _count: { select: { queuePlayers: true, courts: true } } },
+      select: { _count: { select: { queuePlayers: true, courts: true, matches: true } } },
     });
     responseData(response, {
       ...workspaceView(
@@ -3823,6 +3874,15 @@ async function createMatch(
   const manualQueue = !body.suggestionToken && !body.courtId;
   const settings = (await ensureWorkspace(queueMasterId)).settings;
   const matchId = await withTransactionRetry(async (tx) => {
+    const scoringWorkspace = await tx.queueWorkspace.findUniqueOrThrow({
+      where: { queueMasterId },
+    });
+    if (scoringWorkspace.endedAt)
+      throw conflict("SESSION_ENDED", "Start a fresh queue before creating matches.");
+    const matchCount = await tx.match.count({ where: { queueMasterId } });
+    if (scoringState(scoringWorkspace.scoringTarget, matchCount).scoringSetupRequired)
+      throw conflict("SCORING_SETUP_REQUIRED", "Choose scoring before creating a match.");
+    const matchScoring = sessionScoring(scoringWorkspace.scoringTarget, scoreSettings(settings));
     let generatedLoneFemalePolicy: ReturnType<typeof loneFemalePolicy> | null = null;
     let generatedMatchupAdvisory: ReturnType<typeof lowSkillLoneFemaleAdvisory> = null;
     if (body.suggestionPayload && !body.overrideToManual) {
@@ -4087,10 +4147,7 @@ async function createMatch(
               ? body.suggestionPayload.key
               : null,
         suggestionExplanation,
-        pointsToWin: settings.pointsToWin,
-        winBy: settings.winBy,
-        scoreCap: settings.scoreCap,
-        bestOf: settings.bestOf,
+        ...matchScoring,
         startedAt: court ? new Date() : null,
         participants: {
           create: all.map((id) => ({
@@ -5258,6 +5315,7 @@ async function buildSnapshot(queueMasterId: string, database = db): Promise<Clou
     queueMasterId,
     settings: settings ? settingsView(settings) : null,
     workspace: {
+      scoringTarget: workspace.scoringTarget ?? null,
       startedAt: workspace.startedAt.toISOString(),
       endedAt: workspace.endedAt?.toISOString() ?? null,
       lateArrivalCutoffAt: workspace.lateArrivalCutoffAt?.toISOString() ?? null,
@@ -6281,7 +6339,7 @@ api.post(
     });
     const account = await db.queueMaster.findUnique({
       where: { id: queueMasterId },
-      select: { _count: { select: { queuePlayers: true, courts: true } } },
+      select: { _count: { select: { queuePlayers: true, courts: true, matches: true } } },
     });
     responseData(
       response,
