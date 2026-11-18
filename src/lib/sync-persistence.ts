@@ -2,13 +2,16 @@ import { isDeepStrictEqual } from "node:util";
 import {
   mergeSyncSnapshots,
   mergeSyncMetadata,
+  reviewSessionResetSnapshots,
   reviewSyncSnapshots,
+  seedSyncMetadata,
   stampSnapshotChanges,
   skillWeight,
   type CloudSnapshotV2,
   type SkillLevel,
   type SyncMetadata,
   type SyncChoices,
+  type SessionResetMarker,
 } from "@shuttle-queue/domain";
 import { conflict } from "./errors.js";
 import { normalizeName } from "./normalize.js";
@@ -161,6 +164,7 @@ export type SyncUpload = {
   baseCloudRevision: number;
   force: boolean;
   snapshot: CloudSnapshotV2;
+  sessionReset?: SessionResetMarker;
   metadata?: SyncMetadata;
   baseSnapshot?: CloudSnapshotV2;
   resolutions?: SyncChoices;
@@ -1313,12 +1317,21 @@ export async function persistSyncSnapshot(
         "Cloud data changed during review. Sync again to review the latest changes.",
       );
     const review = readCurrent
-      ? reviewSyncSnapshots(
-          upload.snapshot,
-          current.snapshot,
-          upload.baseSnapshot,
-          upload.resolutions,
-        )
+      ? upload.sessionReset
+        ? reviewSessionResetSnapshots(
+            upload.snapshot,
+            current.snapshot,
+            upload.baseSnapshot,
+            upload.sessionReset,
+            state.cloudRevision,
+            upload.resolutions,
+          )
+        : reviewSyncSnapshots(
+            upload.snapshot,
+            current.snapshot,
+            upload.baseSnapshot,
+            upload.resolutions,
+          )
       : { snapshot: upload.snapshot, conflicts: [] };
     if (review.conflicts.length)
       throw conflict(
@@ -1330,7 +1343,10 @@ export async function persistSyncSnapshot(
       current.snapshot,
       review.snapshot,
       mergeSyncMetadata(
-        upload.metadata,
+        upload.sessionReset
+          ? (current.metadata ??
+              seedSyncMetadata(current.snapshot, upload.deviceId, new Date().toISOString()))
+          : upload.metadata,
         current.metadata ?? (state.mergeMetadata as SyncMetadata | undefined),
       ),
       upload.deviceId,
@@ -1377,6 +1393,23 @@ export async function persistSyncSnapshot(
         finalSnapshot,
       );
     }
+    if (upload.sessionReset && sessionChanged)
+      await tx.auditLog.deleteMany({
+        where: {
+          queueMasterId,
+          entityType: {
+            in: [
+              "MATCH",
+              "QUEUE_PLAYER",
+              "COURT",
+              "WORKSPACE",
+              "PAYMENT",
+              "FEE_CONFIG",
+              "SYNERGY_TEAM",
+            ],
+          },
+        },
+      });
     const insertedAuditRows = await reconcileSyncSnapshot(
       tx,
       queueMasterId,

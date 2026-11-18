@@ -852,6 +852,13 @@ api.put("/sync/snapshot", requireSyncAuth, requireMutationOrigin, (request, resp
         force: z.boolean().default(false),
         snapshot: z.record(z.string(), z.unknown()),
         baseSnapshot: z.record(z.string(), z.unknown()).optional(),
+        sessionReset: z
+          .object({
+            resetId: z.string().min(1).max(200),
+            previousStartedAt: z.iso.datetime(),
+            baseCloudRevision: z.number().int().min(0),
+          })
+          .optional(),
         resolutions: z
           .record(
             z.string(),
@@ -896,14 +903,6 @@ api.put("/sync/snapshot", requireSyncAuth, requireMutationOrigin, (request, resp
     )
       throw badRequest("The snapshot is not valid for this account.");
     const queueMasterId = authUser(request).id;
-    const observedState = await db.accountSyncState.upsert({
-      where: { queueMasterId },
-      create: { queueMasterId, schemaVersion: 2 },
-      update: {},
-    });
-    const observedSnapshot = await snapshotWithSynergyTeams(
-      await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId)),
-    );
     const result = await withTransactionRetry(
       (tx) =>
         persistSyncSnapshot(
@@ -912,15 +911,13 @@ api.put("/sync/snapshot", requireSyncAuth, requireMutationOrigin, (request, resp
           queueMasterId,
           async () => {
             const currentState = await tx.accountSyncState.findUnique({ where: { queueMasterId } });
-            if (!currentState || currentState.version !== observedState.version)
-              throw conflict(
-                "SYNC_CLOUD_CHANGED",
-                "Cloud data changed while the current snapshot was being prepared. Retry synchronization; pending work is preserved.",
-                { cloudRevision: currentState?.cloudRevision ?? observedState.cloudRevision },
-              );
+            const currentSnapshot = await snapshotWithSynergyTeams(
+              await snapshotWithMatchSnapshots(await buildSnapshot(queueMasterId, tx)),
+              tx,
+            );
             return {
-              snapshot: observedSnapshot,
-              metadata: observedState.mergeMetadata as any,
+              snapshot: currentSnapshot,
+              metadata: currentState?.mergeMetadata as any,
             };
           },
         ),
