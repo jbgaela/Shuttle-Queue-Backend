@@ -44,7 +44,13 @@ test("live rankings reserve the top ten while retaining three prize places", () 
       { rank: 11, eligible: false, isPrizePosition: false },
     ],
   );
-  assert.equal(PRIZE_RANKING_METHOD.version, "wilson95-v3");
+  assert.equal(PRIZE_RANKING_METHOD.version, "wilson95-v4");
+  assert.deepEqual(PRIZE_RANKING_METHOD.tiebreaks, [
+    "RAW_WIN_RATE",
+    "POINT_DIFFERENTIAL",
+    "POINT_PERCENTAGE",
+    "MATCHES_PLAYED",
+  ]);
   assert.equal(PRIZE_RANKING_METHOD.minimumMatches, 5);
   assert.equal(PRIZE_RANKING_METHOD.prizePlaces, 3);
 });
@@ -145,7 +151,7 @@ test("public ranking snapshots include every joined player and hide private fiel
   assert.equal("skillLevel" in rows[0]!, false);
 });
 
-test("public ranking snapshot ordering is deterministic for equal records", () => {
+test("public ranking snapshot shares ranks for equal performance", () => {
   const rows = publicRankingRowsFromSnapshot({
     queueMasterId: "queue",
     queuePlayers: [
@@ -171,7 +177,11 @@ test("public ranking snapshot ordering is deterministic for equal records", () =
   } as unknown as Parameters<typeof publicRankingRowsFromSnapshot>[0]);
   assert.deepEqual(
     rows.map((row) => row.player),
-    ["Beta", "alpha"],
+    ["alpha", "Beta"],
+  );
+  assert.deepEqual(
+    rows.map((row) => row.rank),
+    [11, 11],
   );
 });
 
@@ -451,7 +461,7 @@ test("new public snapshots use the eligibility-first ranking order", () => {
     ],
     matches: [],
   });
-  assert.equal(snapshot.rankingMethod.version, "wilson95-v3");
+  assert.equal(snapshot.rankingMethod.version, "wilson95-v4");
   assert.equal(snapshot.schemaVersion, 4);
   assert.equal(isPublicRankingSnapshot(snapshot), true);
   assert.deepEqual(
