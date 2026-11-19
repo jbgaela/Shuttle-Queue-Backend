@@ -59,3 +59,36 @@ test("balanced tokens require a valid strength gap and non-balanced tokens rejec
   );
   assert.throws(() => parseAndVerifySuggestionToken(extra, secret));
 });
+
+test("Auto Create tokens require valid Open-mode priority and skill metadata", () => {
+  const autoCreate = {
+    ...payload,
+    mode: "OPEN",
+    strategy: "AUTO_CREATE",
+    priorityPlayerId: "a",
+    skillRange: 2,
+  };
+  const token = signSuggestionToken(autoCreate, secret, "v1-auto-create");
+  const parsed = parseAndVerifySuggestionToken(token, secret);
+  assert.equal(parsed.strategy, "AUTO_CREATE");
+  assert.equal(parsed.priorityPlayerId, "a");
+  assert.equal(parsed.skillRange, 2);
+  assert.throws(() =>
+    parseAndVerifySuggestionToken(
+      signSuggestionToken({ ...autoCreate, mode: "BALANCED" }, secret, "v1-auto-create"),
+      secret,
+    ),
+  );
+  assert.throws(() =>
+    parseAndVerifySuggestionToken(
+      signSuggestionToken({ ...autoCreate, priorityPlayerId: undefined }, secret, "v1-auto-create"),
+      secret,
+    ),
+  );
+  assert.throws(() =>
+    parseAndVerifySuggestionToken(
+      signSuggestionToken({ ...autoCreate, skillRange: 6 }, secret, "v1-auto-create"),
+      secret,
+    ),
+  );
+});

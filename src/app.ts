@@ -60,10 +60,12 @@ import {
   lowSkillLoneFemaleAdvisory,
   MATCHMAKING_ALGORITHM,
   suggestMatch,
+  suggestAutoCreate,
   undefeatedChallengePlayers,
   UNDEFEATED_CHALLENGE_MINIMUM_MATCHES,
   UNDEFEATED_CHALLENGE_RANK_LIMIT,
   validateBalancedLineup,
+  validateAutoCreateLineup,
   validateGuidedLineup,
   validateMatchmakingConstraints,
   validateMixedDoublesLineup,
@@ -139,6 +141,11 @@ const modeValues = Object.values(MatchmakingMode) as [string, ...string[]];
 const accountPasswordSchema = z.string().min(8).max(128);
 const suggestionRequestSchema = z.discriminatedUnion("mode", [
   z.strictObject({
+    mode: z.literal(MatchmakingMode.OPEN),
+    strategy: z.literal("AUTO_CREATE").optional(),
+    excludeKeys: z.array(z.string()).max(50).default([]),
+  }),
+  z.strictObject({
     mode: z.literal(MatchmakingMode.GUIDED),
     excludeKeys: z.array(z.string()).max(50).default([]),
   }),
@@ -149,7 +156,6 @@ const suggestionRequestSchema = z.discriminatedUnion("mode", [
   }),
   z.strictObject({
     mode: z.enum([
-      MatchmakingMode.OPEN,
       MatchmakingMode.SAME_SKILL,
       MatchmakingMode.SAME_GENDER,
       MatchmakingMode.MIXED_DOUBLES,
@@ -642,8 +648,9 @@ const responseData = (response: Response, data: unknown, status = 200, meta?: un
       : null;
   const teamA = suggestion?.teamA;
   const teamB = suggestion?.teamB;
+  const autoCreate = suggestion?.strategy === "AUTO_CREATE";
   const advisory =
-    suggestion && Array.isArray(teamA) && Array.isArray(teamB)
+    !autoCreate && suggestion && Array.isArray(teamA) && Array.isArray(teamB)
       ? lowSkillLoneFemaleAdvisory(
           teamA as Array<{ id: string; displayName: string; gender: string; skillLevel: string }>,
           teamB as Array<{ id: string; displayName: string; gender: string; skillLevel: string }>,
@@ -1528,14 +1535,21 @@ function matchView(match: any) {
     gender: participant.gender,
     skillLevel: participant.skillLevel,
   });
-  const matchupAdvisory = lowSkillLoneFemaleAdvisory(
-    participants
-      .filter((participant: any) => participant.team === TeamSide.A)
-      .map(toAdvisoryPlayer),
-    participants
-      .filter((participant: any) => participant.team === TeamSide.B)
-      .map(toAdvisoryPlayer),
-  );
+  const autoCreate =
+    match.suggestionExplanation &&
+    typeof match.suggestionExplanation === "object" &&
+    Boolean((match.suggestionExplanation as Record<string, unknown>).autoCreate) &&
+    !(match.suggestionExplanation as Record<string, unknown>).overrideToManual;
+  const matchupAdvisory = autoCreate
+    ? null
+    : lowSkillLoneFemaleAdvisory(
+        participants
+          .filter((participant: any) => participant.team === TeamSide.A)
+          .map(toAdvisoryPlayer),
+        participants
+          .filter((participant: any) => participant.team === TeamSide.B)
+          .map(toAdvisoryPlayer),
+      );
   return {
     id: match.id,
     status: match.status,
@@ -3394,6 +3408,8 @@ api.post(
       return;
     }
     const body = parsed;
+    const isAutoCreate =
+      body.mode === MatchmakingMode.OPEN && "strategy" in body && body.strategy === "AUTO_CREATE";
     const matchmakingStartedAt = Date.now();
     const workspace = await workspaceFor(request);
     const settings = (await ensureWorkspace(authUser(request).id)).settings;
@@ -3454,20 +3470,20 @@ api.post(
         restEligibleAt(player.lastMatchEndedAt, settings.minimumRestMinutes).getTime() <=
           Date.now(),
     ).length;
-    let suggestion = suggestMatch(
-      input,
-      body.mode as MatchmakingMode,
-      history,
-      body.excludeKeys,
-      options,
-    );
+    const generateSuggestion = () =>
+      isAutoCreate
+        ? suggestAutoCreate(input, history, body.excludeKeys, options)
+        : suggestMatch(input, body.mode as MatchmakingMode, history, body.excludeKeys, options);
+    let suggestion = generateSuggestion();
     let cycleRestarted = false;
     if (
       !suggestion &&
       body.excludeKeys.length &&
       body.mode !== MatchmakingMode.UNDEFEATED_CHALLENGE
     ) {
-      suggestion = suggestMatch(input, body.mode as MatchmakingMode, history, [], options);
+      suggestion = isAutoCreate
+        ? suggestAutoCreate(input, history, [], options)
+        : suggestMatch(input, body.mode as MatchmakingMode, history, [], options);
       cycleRestarted = Boolean(suggestion);
     }
     if (!suggestion) {
@@ -3544,7 +3560,9 @@ api.post(
             ? "Some players are still completing their required rest period."
             : body.mode === MatchmakingMode.BALANCED
               ? `No exact Handicap +${strengthGap} strength lineup is available. Choose a tighter mode and generate again.`
-              : "No eligible group satisfies this mode.";
+              : isAutoCreate
+                ? "No fair Auto Create lineup is available. Check player rest, Synergy Team locks, and Newbie partner rules."
+                : "No eligible group satisfies this mode.";
       logger.info(
         {
           eligibleCount: eligibleCount,
@@ -3609,6 +3627,13 @@ api.post(
       queueMasterId: authUser(request).id,
       revision: workspace.matchmakingRevision,
       mode: body.mode,
+      ...(isAutoCreate
+        ? {
+            strategy: "AUTO_CREATE",
+            priorityPlayerId: (suggestion.explanation as any).autoCreate.priorityPlayerId,
+            skillRange: (suggestion.explanation as any).autoCreate.skillRange,
+          }
+        : {}),
       strengthGap,
       key: suggestion.key,
       teamA: suggestion.teamA.map((p) => p.id),
@@ -3653,13 +3678,14 @@ api.post(
         expiresAt,
         lateArrivalCutoffAt: workspace.lateArrivalCutoffAt,
         strengthGap,
+        ...(isAutoCreate ? { strategy: "AUTO_CREATE" as const } : {}),
         ...suggestion,
         teamA: suggestion.teamA.map(viewPlayer),
         teamB: suggestion.teamB.map(viewPlayer),
         explanation: {
           ...suggestion.explanation,
           algorithmVersion: MATCHMAKING_ALGORITHM,
-          generatedGenderRule: "NO_TWO_FEMALE_VS_TWO_MALE",
+          ...(isAutoCreate ? {} : { generatedGenderRule: "NO_TWO_FEMALE_VS_TWO_MALE" }),
           cycleRestarted,
         },
       },
@@ -3880,6 +3906,8 @@ async function createMatch(
     if (scoringState(scoringWorkspace.scoringTarget, matchCount).scoringSetupRequired)
       throw conflict("SCORING_SETUP_REQUIRED", "Choose scoring before creating a match.");
     const matchScoring = sessionScoring(scoringWorkspace.scoringTarget, scoreSettings(settings));
+    const autoCreateMatch =
+      !body.overrideToManual && body.suggestionPayload?.strategy === "AUTO_CREATE";
     let generatedLoneFemalePolicy: ReturnType<typeof loneFemalePolicy> | null = null;
     let generatedMatchupAdvisory: ReturnType<typeof lowSkillLoneFemaleAdvisory> = null;
     if (body.suggestionPayload && !body.overrideToManual) {
@@ -3936,7 +3964,9 @@ async function createMatch(
     if (body.suggestionPayload?.mode === MatchmakingMode.GUIDED && !body.overrideToManual)
       validateGuidedMutation(teamAPlayers, teamBPlayers, synergyError);
     else if (synergyError) throw conflict("SYNERGY_TEAM_LINEUP", synergyError);
-    generatedMatchupAdvisory = lowSkillLoneFemaleAdvisory(teamAPlayers, teamBPlayers);
+    generatedMatchupAdvisory = autoCreateMatch
+      ? null
+      : lowSkillLoneFemaleAdvisory(teamAPlayers, teamBPlayers);
     if (body.suggestionPayload && !body.overrideToManual) {
       const suggestionSynergyError = validateSynergyLineup(
         teamAPlayers,
@@ -3945,12 +3975,16 @@ async function createMatch(
       );
       if (body.suggestionPayload.mode !== MatchmakingMode.GUIDED && suggestionSynergyError)
         throw conflict("SYNERGY_TEAM_LINEUP", suggestionSynergyError);
-      generatedLoneFemalePolicy = loneFemalePolicy(
-        teamAPlayers,
-        teamBPlayers,
-        body.suggestionPayload.mode === MatchmakingMode.MIXED_DOUBLES,
-      );
-      generatedMatchupAdvisory = lowSkillLoneFemaleAdvisory(teamAPlayers, teamBPlayers);
+      generatedLoneFemalePolicy = autoCreateMatch
+        ? null
+        : loneFemalePolicy(
+            teamAPlayers,
+            teamBPlayers,
+            body.suggestionPayload.mode === MatchmakingMode.MIXED_DOUBLES,
+          );
+      generatedMatchupAdvisory = autoCreateMatch
+        ? null
+        : lowSkillLoneFemaleAdvisory(teamAPlayers, teamBPlayers);
       if (body.suggestionPayload.mode === MatchmakingMode.MIXED_DOUBLES) {
         const mixedError = validateMixedDoublesLineup(teamAPlayers, teamBPlayers);
         if (mixedError)
@@ -3959,7 +3993,10 @@ async function createMatch(
             originalMode: MatchmakingMode.MIXED_DOUBLES,
           });
       }
-      if (isProhibitedGeneratedGenderMatch(teamAPlayers, teamBPlayers))
+      if (
+        body.suggestionPayload.strategy !== "AUTO_CREATE" &&
+        isProhibitedGeneratedGenderMatch(teamAPlayers, teamBPlayers)
+      )
         throw conflict(
           "GENERATED_GENDER_RULE",
           "Generated matchups cannot place two female players against two male players.",
@@ -3978,7 +4015,8 @@ async function createMatch(
       if (
         body.suggestionPayload.mode === MatchmakingMode.SAME_SKILL ||
         body.suggestionPayload.mode === MatchmakingMode.SAME_GENDER ||
-        body.suggestionPayload.mode === MatchmakingMode.OPEN
+        (body.suggestionPayload.mode === MatchmakingMode.OPEN &&
+          body.suggestionPayload.strategy !== "AUTO_CREATE")
       ) {
         const guaranteeError = validateModeGuarantee(
           body.suggestionPayload.mode as MatchmakingMode,
@@ -3988,6 +4026,20 @@ async function createMatch(
         );
         if (guaranteeError)
           throw conflict("MODE_CONSTRAINT_VIOLATION", guaranteeError, {
+            canConvertToManual: true,
+            originalMode: body.suggestionPayload.mode,
+          });
+      }
+      if (body.suggestionPayload.strategy === "AUTO_CREATE") {
+        const autoCreateError = validateAutoCreateLineup(
+          teamAPlayers,
+          teamBPlayers,
+          String(body.suggestionPayload.priorityPlayerId),
+          Number(body.suggestionPayload.skillRange),
+          synergyTeams as any,
+        );
+        if (autoCreateError)
+          throw conflict("AUTO_CREATE_CONSTRAINT_VIOLATION", autoCreateError, {
             canConvertToManual: true,
             originalMode: body.suggestionPayload.mode,
           });
@@ -4054,7 +4106,18 @@ async function createMatch(
           challengeRelabeled: challengeAdjusted,
           adjusted: Boolean(body.suggestionAdjusted),
           generatedOrigin: "SUGGESTION",
-          generatedGenderRule: "NO_TWO_FEMALE_VS_TWO_MALE",
+          ...(body.suggestionPayload.strategy === "AUTO_CREATE"
+            ? {}
+            : { generatedGenderRule: "NO_TWO_FEMALE_VS_TWO_MALE" }),
+          ...(autoCreateMatch
+            ? {
+                autoCreate: {
+                  strategy: "AUTO_CREATE",
+                  priorityPlayerId: String(body.suggestionPayload.priorityPlayerId),
+                  skillRange: Number(body.suggestionPayload.skillRange),
+                },
+              }
+            : {}),
           loneFemalePolicy: generatedLoneFemalePolicy,
           matchupAdvisory: generatedMatchupAdvisory,
           rest: { minimumRestMinutes: settings.minimumRestMinutes },
@@ -4261,7 +4324,11 @@ api.post(
       if (match.matchmakingMode === MatchmakingMode.GUIDED)
         validateGuidedMutation(startTeamA, startTeamB, startSynergyError);
       else if (startSynergyError) throw conflict("SYNERGY_TEAM_LINEUP", startSynergyError);
-      const startAdvisory = lowSkillLoneFemaleAdvisory(startTeamA, startTeamB);
+      const autoCreateStart =
+        Boolean(startExplanation?.autoCreate) && !startExplanation?.overrideToManual;
+      const startAdvisory = autoCreateStart
+        ? null
+        : lowSkillLoneFemaleAdvisory(startTeamA, startTeamB);
       if (startAdvisory && body.playerPreferenceConfirmed !== true)
         throw conflict(
           "PLAYER_PREFERENCE_CONFIRMATION_REQUIRED",
@@ -4277,6 +4344,10 @@ api.post(
         match.matchmakingMode === MatchmakingMode.OPEN ||
         match.matchmakingMode === MatchmakingMode.UNDEFEATED_CHALLENGE
       ) {
+        const autoCreate =
+          startExplanation?.autoCreate && typeof startExplanation.autoCreate === "object"
+            ? (startExplanation.autoCreate as { priorityPlayerId?: unknown; skillRange?: unknown })
+            : null;
         const byId = new Map(players.map((player: any) => [player.id, player]));
         const toMatchPlayer = (id: string): MatchPlayer =>
           matchmakingPlayerFromQueuePlayer(byId.get(id), byId, currentSynergyTeams);
@@ -4291,7 +4362,16 @@ api.post(
         const lineupSynergyError = validateSynergyLineup(teamA, teamB, currentSynergyTeams as any);
         if (lineupSynergyError && match.matchmakingMode !== MatchmakingMode.GUIDED)
           throw conflict("SYNERGY_TEAM_LINEUP", lineupSynergyError);
-        if (match.matchmakingMode === MatchmakingMode.MIXED_DOUBLES) {
+        if (autoCreate) {
+          const autoCreateError = validateAutoCreateLineup(
+            teamA,
+            teamB,
+            String(autoCreate.priorityPlayerId),
+            Number(autoCreate.skillRange),
+            currentSynergyTeams as any,
+          );
+          if (autoCreateError) throw conflict("AUTO_CREATE_CONSTRAINT_VIOLATION", autoCreateError);
+        } else if (match.matchmakingMode === MatchmakingMode.MIXED_DOUBLES) {
           const mixedError = validateMixedDoublesLineup(teamA, teamB);
           if (mixedError) throw conflict("MIXED_DOUBLES_COMPOSITION", mixedError);
         } else if (
@@ -6451,12 +6531,21 @@ api.patch(
         assertPlayersRestEligible(addedPlayers, settings.minimumRestMinutes);
       const teamAPlayers = body.teamA.map(toMatchPlayer);
       const teamBPlayers = body.teamB.map(toMatchPlayer);
+      const currentExplanation =
+        match.suggestionExplanation && typeof match.suggestionExplanation === "object"
+          ? (match.suggestionExplanation as Record<string, unknown>)
+          : null;
+      const autoCreateMetadata =
+        currentExplanation?.autoCreate && typeof currentExplanation.autoCreate === "object"
+          ? (currentExplanation.autoCreate as { priorityPlayerId?: unknown; skillRange?: unknown })
+          : null;
+      const currentSynergyTeams = (
+        await tx.synergyTeam.findMany({ where: { queueMasterId } })
+      ).filter(validSynergyTeam);
       const synergyError = validateSynergyLineup(
         teamAPlayers,
         teamBPlayers,
-        (await tx.synergyTeam.findMany({ where: { queueMasterId } })).filter(
-          validSynergyTeam,
-        ) as any,
+        currentSynergyTeams as any,
       );
       if (match.matchmakingMode === MatchmakingMode.GUIDED && !body.overrideToManual)
         validateGuidedMutation(teamAPlayers, teamBPlayers, synergyError);
@@ -6464,6 +6553,7 @@ api.patch(
       else if (
         !body.overrideToManual &&
         match.source === MatchSource.AUTOMATIC &&
+        !autoCreateMetadata &&
         isProhibitedGeneratedGenderMatch(teamAPlayers, teamBPlayers)
       )
         throw conflict(
@@ -6483,6 +6573,20 @@ api.patch(
           { canConvertToManual: true, originalMode: match.matchmakingMode },
         );
       }
+      if (!body.overrideToManual && autoCreateMetadata) {
+        const autoCreateError = validateAutoCreateLineup(
+          teamAPlayers,
+          teamBPlayers,
+          String(autoCreateMetadata.priorityPlayerId),
+          Number(autoCreateMetadata.skillRange),
+          currentSynergyTeams as any,
+        );
+        if (autoCreateError)
+          throw conflict("AUTO_CREATE_CONSTRAINT_VIOLATION", autoCreateError, {
+            canConvertToManual: true,
+            originalMode: match.matchmakingMode,
+          });
+      }
       if (match.matchmakingMode === MatchmakingMode.BALANCED && !body.overrideToManual) {
         const balanceError = validateBalancedLineup(
           teamAPlayers,
@@ -6500,6 +6604,7 @@ api.patch(
       if (
         !body.overrideToManual &&
         editedMode &&
+        !autoCreateMetadata &&
         (
           [
             MatchmakingMode.SAME_SKILL,
@@ -6684,7 +6789,10 @@ api.patch(
         match.suggestionExplanation && typeof match.suggestionExplanation === "object"
           ? (match.suggestionExplanation as Record<string, unknown>)
           : null;
-      const updatedAdvisory = lowSkillLoneFemaleAdvisory(teamAPlayers, teamBPlayers);
+      const updatedAdvisory =
+        autoCreateMetadata && !body.overrideToManual
+          ? null
+          : lowSkillLoneFemaleAdvisory(teamAPlayers, teamBPlayers);
       const preservedMode =
         !body.overrideToManual &&
         match.matchmakingMode !== null &&

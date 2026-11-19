@@ -13,11 +13,13 @@ import {
   isGuidedMatchAvailable as isDomainGuidedMatchAvailable,
   isMixedDoublesGroup as isDomainMixedDoublesGroup,
   isStandardMixedDoublesLineup as isDomainStandardMixedDoublesLineup,
+  suggestAutoCreate as suggestDomainAutoCreate,
   suggestMatch as suggestDomainMatch,
   undefeatedChallengePlayers as domainUndefeatedChallengePlayers,
   validateGuidedLineup as validateDomainGuidedLineup,
   validateMatchmakingConstraints as validateDomainMatchmakingConstraints,
   validateMixedDoublesLineup as validateDomainMixedDoublesLineup,
+  validateAutoCreateLineup as validateDomainAutoCreateLineup,
   validateSynergyLineup as validateDomainSynergyLineup,
   type DomainSynergyTeam,
   type GuidedAvailabilitySummary as DomainGuidedAvailabilitySummary,
@@ -259,6 +261,58 @@ export function suggestMatch(
     explanation: result.explanation,
   };
 }
+
+export function suggestAutoCreate(
+  players: MatchPlayer[],
+  history: MatchHistory,
+  excludedKeys: string[] = [],
+  options: MatchmakingOptions = {},
+): Suggestion | null {
+  const originalById = new Map(players.map((player) => [player.id, player]));
+  const result = suggestDomainAutoCreate(
+    players.map(toDomainPlayer),
+    history as unknown as DomainMatchHistory,
+    excludedKeys,
+    { ...options, synergyTeams: options.synergyTeams ?? [] },
+  );
+  if (!result) return null;
+  const toLocal = (player: DomainMatchPlayer): MatchPlayer => {
+    const original = originalById.get(player.id);
+    if (!original) throw new Error("Auto Create suggestion referenced an unknown player.");
+    return {
+      ...original,
+      synergyTeamId: player.synergyTeamId ?? undefined,
+      effectiveSkillWeight: player.effectiveSkillWeight,
+      effectiveSkillLevel: player.effectiveSkillLevel,
+    };
+  };
+  return {
+    mode: MatchmakingMode.OPEN,
+    teamA: result.teamA.map(toLocal),
+    teamB: result.teamB.map(toLocal),
+    teamATotal: result.teamATotal,
+    teamBTotal: result.teamBTotal,
+    difference: result.difference,
+    key: result.key,
+    matchupAdvisory: result.matchupAdvisory ?? null,
+    explanation: result.explanation,
+  };
+}
+
+export const validateAutoCreateLineup = (
+  teamA: MatchPlayer[],
+  teamB: MatchPlayer[],
+  priorityPlayerId: string,
+  skillRange: number,
+  synergyTeams: DomainSynergyTeam[] = [],
+) =>
+  validateDomainAutoCreateLineup(
+    teamA.map(toDomainPlayer),
+    teamB.map(toDomainPlayer),
+    priorityPlayerId,
+    skillRange,
+    synergyTeams,
+  );
 
 const toDomainLineup = (players: MatchPlayer[]): DomainMatchPlayer[] => players.map(toDomainPlayer);
 export const isMixedDoublesGroup = (group: MatchPlayer[]) =>

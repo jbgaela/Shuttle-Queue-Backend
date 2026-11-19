@@ -28,6 +28,7 @@ try {
       "version-update",
       "ui-continuity",
       "ui-offline-controls",
+      "auto-create",
       ...(browser === "chromium" ? ["sync-deadline"] : []),
       ...Array.from({ length: 20 }, (_, index) => `load-${String(index + 1).padStart(2, "0")}`),
     ]) {
@@ -48,7 +49,9 @@ try {
         ? 100
         : scenario === "ui-offline-controls"
           ? 12
-          : 4;
+          : scenario === "auto-create"
+            ? 8
+            : 4;
       const playerIds = Array.from({ length: playerCount }, () => randomUUID());
       const queueIds = Array.from({ length: playerCount }, () => randomUUID());
       await prisma.player.createMany({
@@ -57,7 +60,7 @@ try {
           queueMasterId: account.id,
           displayName: `Seed ${index + 1}`,
           normalizedName: `seed ${index + 1}`,
-          gender: "MALE",
+          gender: scenario === "auto-create" && index % 2 === 0 ? "FEMALE" : "MALE",
           skillLevel: "BEGINNER",
           skillWeight: 2,
         })),
@@ -69,12 +72,15 @@ try {
           playerId: playerIds[index]!,
           displayNameSnapshot: `Seed ${index + 1}`,
           normalizedNameSnapshot: `seed ${index + 1}`,
-          genderSnapshot: "MALE",
+          genderSnapshot: scenario === "auto-create" && index % 2 === 0 ? "FEMALE" : "MALE",
           skillLevelSnapshot: "BEGINNER",
           skillWeightSnapshot: 2,
           status: "WAITING",
           checkedInAt: seededAt,
-          queueEnteredAt: seededAt,
+          queueEnteredAt:
+            scenario === "auto-create"
+              ? new Date(seededAt.getTime() - Math.floor(index / 2) * 60_000)
+              : seededAt,
           ...(scenario.startsWith("load-")
             ? {
                 lastMatchEndedAt: new Date(seededAt.getTime() - Math.floor(index / 4) * 60_000),
@@ -88,14 +94,15 @@ try {
           amountDueMinor: 5000,
         })),
       });
-      const synergyTeamId = randomUUID();
-      await prisma.synergyTeam.create({
-        data: {
-          id: synergyTeamId,
-          queueMasterId: account.id,
-          queuePlayerIds: queueIds.slice(0, 2),
-        },
-      });
+      const synergyTeamId = scenario === "auto-create" ? null : randomUUID();
+      if (synergyTeamId)
+        await prisma.synergyTeam.create({
+          data: {
+            id: synergyTeamId,
+            queueMasterId: account.id,
+            queuePlayerIds: queueIds.slice(0, 2),
+          },
+        });
       const courtCount = scenario.startsWith("load-") ? 10 : 1;
       const courtIds = Array.from({ length: courtCount }, () => randomUUID());
       await prisma.court.createMany({
@@ -208,7 +215,7 @@ try {
         const collections = [
           ["players", playerIds],
           ["queuePlayers", queueIds],
-          ["synergyTeams", [synergyTeamId]],
+          ["synergyTeams", synergyTeamId ? [synergyTeamId] : []],
           ["courts", courtIds],
           ["matches", matches.map(({ match }) => match.id)],
           ["payments", paymentRows.map(({ id }) => id)],

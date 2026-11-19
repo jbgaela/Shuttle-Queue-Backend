@@ -18,6 +18,9 @@ export const suggestionTokenPayloadSchema = z
     queueMasterId: z.string().min(1),
     revision: z.number().int().nonnegative(),
     mode: modeSchema,
+    strategy: z.literal("AUTO_CREATE").optional(),
+    priorityPlayerId: z.string().min(1).optional(),
+    skillRange: z.number().int().min(0).max(5).optional(),
     strengthGap: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
     key: z.string().min(3),
     teamA: teamSchema,
@@ -69,6 +72,14 @@ export function parseAndVerifySuggestionToken(value: string, secret: string) {
   const result = suggestionTokenPayloadSchema.safeParse(parsed);
   if (!result.success) throw new Error("Invalid suggestion token");
   const { teamA, teamB } = result.data;
+  if (
+    result.data.strategy === "AUTO_CREATE"
+      ? result.data.mode !== "OPEN" ||
+        result.data.priorityPlayerId === undefined ||
+        result.data.skillRange === undefined
+      : result.data.priorityPlayerId !== undefined || result.data.skillRange !== undefined
+  )
+    throw new Error("Invalid suggestion token");
   if (
     teamA.length !== teamB.length ||
     new Set([...teamA, ...teamB]).size !== teamA.length + teamB.length
